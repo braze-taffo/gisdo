@@ -22,14 +22,15 @@ a = Analysis(
     datas=datas,
     hiddenimports=[
         "openai",  # llm.py 懒加载，需显式收集
-        "gisdo._model_config",  # importlib.import_module 动态加载，静态分析不可见
         "matplotlib",
         "matplotlib.backends.backend_agg",
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["arcpy"],  # 应用进程永不 import arcpy
+    # 公开版绝不能带 API Key：_model_config.py（含真 Key）不入包。excludes 双保险，
+    # 即使未来某处静态引用它也不会被收集。
+    excludes=["arcpy", "gisdo._model_config"],  # 应用进程永不 import arcpy
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
