@@ -1,4 +1,7 @@
-"""提取工作流视图：对齐门禁 + 数据提取 + 清单展示。"""
+"""提取工作流视图：对齐门禁 + 数据提取 + 清单展示。
+
+操作逻辑按四步组织：① 选权威工程 → ② 输出目录与选项 → ③ 生成并核对对齐块 → ④ 确认提取。
+"""
 
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ from gisdo.engine import ops
 from gisdo.engine.alignment import Alignment, build_draft
 from gisdo.engine.runner import ScriptResult
 from gisdo.engine.versioning import versioned_path
-from gisdo.gui.widgets import JsonTreeView
+from gisdo.gui.widgets import Banner, JsonTreeView, PageHeader
 from gisdo.gui.workers import start_worker
 
 
@@ -20,66 +23,83 @@ class ExtractView(QtWidgets.QWidget):
         self.state = state
         self.log = log
         self.alignment: Alignment | None = None
+        self._current_worker = None
         self._build()
         self.state.inventory_changed.connect(self._on_inventory)
         self.state.modern_runtime_changed.connect(self._refresh_enabled)
 
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+        layout.addWidget(PageHeader("提取", "把 APRX 引用的数据按对齐块提取到版本化目录，带 SHA-256 校验清单"))
 
-        # 工程
+        self.banner = Banner("", "warning")
+        layout.addWidget(self.banner)
+
+        # ① 权威工程
+        step1 = QtWidgets.QGroupBox("① 权威工程")
+        step1_layout = QtWidgets.QVBoxLayout(step1)
         proj_row = QtWidgets.QHBoxLayout()
         self.project_edit = QtWidgets.QLineEdit()
         self.project_edit.setReadOnly(True)
-        self.project_edit.setPlaceholderText("先在“检查”页检查一个 APRX 工程")
+        self.project_edit.setPlaceholderText("先在「检查」页检查一个 APRX 工程（Ctrl+4），结果会自动填到这里")
         browse = QtWidgets.QPushButton("浏览…")
         browse.clicked.connect(self._on_browse_project)
-        proj_row.addWidget(QtWidgets.QLabel("权威工程："))
         proj_row.addWidget(self.project_edit, 1)
         proj_row.addWidget(browse)
-        layout.addLayout(proj_row)
+        step1_layout.addLayout(proj_row)
+        layout.addWidget(step1)
 
-        # 输出目录
+        # ② 输出
+        step2 = QtWidgets.QGroupBox("② 输出目录与选项")
+        step2_layout = QtWidgets.QVBoxLayout(step2)
         out_row = QtWidgets.QHBoxLayout()
         self.output_edit = QtWidgets.QLineEdit()
         self.output_edit.setPlaceholderText("留空则自动生成 版本化目录名_v1_日期")
         out_browse = QtWidgets.QPushButton("浏览…")
         out_browse.clicked.connect(self._on_browse_output)
-        out_row.addWidget(QtWidgets.QLabel("输出目录："))
         out_row.addWidget(self.output_edit, 1)
         out_row.addWidget(out_browse)
-        layout.addLayout(out_row)
+        step2_layout.addLayout(out_row)
+        self.skip_hashes = QtWidgets.QCheckBox("跳过 SHA-256（更快，不校验内容一致性）")
+        step2_layout.addWidget(self.skip_hashes)
+        layout.addWidget(step2)
 
-        skip_hashes = QtWidgets.QCheckBox("跳过 SHA-256（更快，不校验内容一致性）")
-        layout.addWidget(skip_hashes)
-        self.skip_hashes = skip_hashes
-
-        # 对齐块
-        layout.addWidget(QtWidgets.QLabel("对齐确认块（可编辑）："))
+        # ③ 对齐块
+        step3 = QtWidgets.QGroupBox("③ 生成并核对对齐块")
+        step3_layout = QtWidgets.QVBoxLayout(step3)
         self.alignment_edit = QtWidgets.QPlainTextEdit()
         self.alignment_edit.setReadOnly(False)
-        self.alignment_edit.setMinimumHeight(180)
-        layout.addWidget(self.alignment_edit)
-
+        self.alignment_edit.setMinimumHeight(150)
+        self.alignment_edit.setPlaceholderText("点击下方按钮，基于工程清单生成对齐确认块；可编辑其中的字段")
+        step3_layout.addWidget(self.alignment_edit)
         gen_btn = QtWidgets.QPushButton("生成对齐块")
         gen_btn.clicked.connect(self._on_generate_alignment)
-        layout.addWidget(gen_btn)
+        step3_layout.addWidget(gen_btn, 0)
+        layout.addWidget(step3)
 
+        # ④ 确认执行
         confirm_row = QtWidgets.QHBoxLayout()
         self.confirm_check = QtWidgets.QCheckBox("我已核对上述对齐信息，确认执行写操作")
         self.confirm_check.toggled.connect(self._refresh_enabled)
         confirm_row.addWidget(self.confirm_check)
         confirm_row.addWidget(QtWidgets.QWidget(), 1)
         self.run_btn = QtWidgets.QPushButton("确认并提取")
+        self.run_btn.setProperty("kind", "primary")
         self.run_btn.clicked.connect(self._on_run)
         self.run_btn.setEnabled(False)
         confirm_row.addWidget(self.run_btn)
         layout.addLayout(confirm_row)
 
         # 结果
-        layout.addWidget(QtWidgets.QLabel("提取清单："))
+        result_group = QtWidgets.QGroupBox("提取清单")
+        result_layout = QtWidgets.QVBoxLayout(result_group)
         self.result_view = JsonTreeView()
-        layout.addWidget(self.result_view, 1)
+        result_layout.addWidget(self.result_view)
+        layout.addWidget(result_group, 1)
+
+        self._refresh_enabled()
 
     def _on_inventory(self, inventory) -> None:
         self.project_edit.setText(self.state.last_aprx)
@@ -89,6 +109,7 @@ class ExtractView(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择 APRX", "", "ArcGIS Pro 工程 (*.aprx)")
         if path:
             self.project_edit.setText(path)
+        self._refresh_enabled()
 
     def _on_browse_output(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "选择输出父目录")
@@ -117,19 +138,25 @@ class ExtractView(QtWidgets.QWidget):
         )
         self.alignment = alignment
         self.alignment_edit.setPlainText(alignment.as_block())
+        self._refresh_enabled()
 
     def _refresh_enabled(self, *args) -> None:
+        runtime_ok = self.state.modern is not None
         ready = (
-            self.state.modern is not None
+            runtime_ok
             and bool(self.project_edit.text().strip())
             and self.confirm_check.isChecked()
             and self.alignment is not None
         )
         self.run_btn.setEnabled(ready)
+        if not runtime_ok:
+            self.banner.set_text("提取需要现代运行时，请先到「运行时」页选定（Ctrl+3）。")
+        else:
+            self.banner.set_text("")
 
     def _on_run(self) -> None:
         if self.alignment is None:
-            QtWidgets.QMessageBox.warning(self, "未生成对齐块", "请先点击“生成对齐块”。")
+            QtWidgets.QMessageBox.warning(self, "未生成对齐块", "请先点击「生成对齐块」。")
             return
         project = self.project_edit.text().strip()
         out = self._default_output()
@@ -137,7 +164,7 @@ class ExtractView(QtWidgets.QWidget):
         self.alignment.confirm()
         self.run_btn.setEnabled(False)
         self.result_view.show_raw_text("正在提取…")
-        start_worker(
+        self._current_worker = start_worker(
             ops.extract_data,
             self.state.modern, project, out,
             alignment=self.alignment, skip_hashes=self.skip_hashes.isChecked(),
@@ -147,6 +174,7 @@ class ExtractView(QtWidgets.QWidget):
         )
 
     def _on_done(self, result: ScriptResult) -> None:
+        self._current_worker = None
         self.run_btn.setEnabled(self.confirm_check.isChecked())
         if result.json is not None:
             self.result_view.show_json(result.json, label="extraction_manifest")
@@ -158,6 +186,7 @@ class ExtractView(QtWidgets.QWidget):
             self.result_view.show_raw_text(result.stderr or result.stdout or f"退出码 {result.returncode}")
 
     def _on_error(self, msg: str) -> None:
+        self._current_worker = None
         self.run_btn.setEnabled(self.confirm_check.isChecked())
         self.result_view.show_raw_text(f"错误：{msg}")
         QtWidgets.QMessageBox.critical(self, "提取失败", msg)

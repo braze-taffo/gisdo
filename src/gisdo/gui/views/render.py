@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
 from gisdo.engine import ops
 from gisdo.engine.alignment import Alignment
 from gisdo.engine.runner import ScriptResult
 from gisdo.engine.versioning import versioned_file
-from gisdo.gui.widgets import JsonTreeView, PngPreview
+from gisdo.gui.widgets import JsonTreeView, PageHeader, PngPreview
 from gisdo.gui.workers import start_worker
 
 
@@ -19,16 +19,32 @@ class RenderView(QtWidgets.QWidget):
         super().__init__()
         self.state = state
         self.log = log
+        self._current_worker = None
         self._build()
 
     def _build(self) -> None:
-        outer = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+        layout.addWidget(PageHeader("出图", "把分类线 JSON 渲染为出版级 PNG/PDF，并做像素级非空校验"))
 
-        # 左：参数表单
-        form_widget = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(form_widget)
-        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(10)
 
+        # 左：参数（三张卡，可滚动）
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        left_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        left_widget = QtWidgets.QWidget()
+        left = QtWidgets.QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 4, 0)
+        left.setSpacing(10)
+
+        # 卡 1：数据与样式
+        style_group = QtWidgets.QGroupBox("数据与样式")
+        form1 = QtWidgets.QFormLayout(style_group)
+        form1.setSpacing(8)
         self.input_edit = QtWidgets.QLineEdit()
         self.input_edit.setPlaceholderText("export_legacy_lines 产出的 JSON")
         input_browse = QtWidgets.QPushButton("浏览…")
@@ -36,44 +52,41 @@ class RenderView(QtWidgets.QWidget):
         input_row = QtWidgets.QHBoxLayout()
         input_row.addWidget(self.input_edit, 1)
         input_row.addWidget(input_browse)
-        form.addRow("输入 JSON：", input_row)
+        form1.addRow("输入 JSON：", input_row)
 
         self.breaks_edit = QtWidgets.QLineEdit("0,20,40,60,80,100")
         self.breaks_edit.setPlaceholderText("逗号分隔，如 0,20,40,60,80,100")
-        form.addRow("分类断点 *：", self.breaks_edit)
+        form1.addRow("分类断点 *：", self.breaks_edit)
 
         self.colors_edit = QtWidgets.QLineEdit()
         self.colors_edit.setPlaceholderText("留空用默认 5 色；如 #ffffb2,#fecc5c,#fd8d3c,#f03b20,#bd0026")
-        form.addRow("颜色：", self.colors_edit)
+        form1.addRow("颜色：", self.colors_edit)
 
         self.labels_edit = QtWidgets.QLineEdit()
         self.labels_edit.setPlaceholderText("留空自动；竖线 | 分隔")
-        form.addRow("图例标签：", self.labels_edit)
+        form1.addRow("图例标签：", self.labels_edit)
+        self.line_width_spin = QtWidgets.QDoubleSpinBox()
+        self.line_width_spin.setRange(0.1, 10)
+        self.line_width_spin.setSingleStep(0.1)
+        self.line_width_spin.setValue(1.1)
+        form1.addRow("线宽：", self.line_width_spin)
+        left.addWidget(style_group)
 
+        # 卡 2：版面与选项
+        layout_group = QtWidgets.QGroupBox("版面与选项")
+        form2 = QtWidgets.QFormLayout(layout_group)
+        form2.setSpacing(8)
         self.title_edit = QtWidgets.QLineEdit()
-        form.addRow("标题：", self.title_edit)
+        form2.addRow("标题：", self.title_edit)
         self.legend_edit = QtWidgets.QLineEdit()
-        form.addRow("图例标题：", self.legend_edit)
+        form2.addRow("图例标题：", self.legend_edit)
 
         self.scale_bar_edit = QtWidgets.QLineEdit()
         self.scale_bar_edit.setPlaceholderText("坐标单位长度，如 2000；留空不加比例尺")
-        form.addRow("比例尺长度：", self.scale_bar_edit)
+        form2.addRow("比例尺长度：", self.scale_bar_edit)
         self.scale_label_edit = QtWidgets.QLineEdit()
-        form.addRow("比例尺文本：", self.scale_label_edit)
+        form2.addRow("比例尺文本：", self.scale_label_edit)
 
-        self.output_png_edit = QtWidgets.QLineEdit()
-        self.output_png_edit.setPlaceholderText("留空自动生成 版本化名_v1_日期.png")
-        png_browse = QtWidgets.QPushButton("浏览…")
-        png_browse.clicked.connect(self._browse_png)
-        png_row = QtWidgets.QHBoxLayout()
-        png_row.addWidget(self.output_png_edit, 1)
-        png_row.addWidget(png_browse)
-        form.addRow("输出 PNG：", png_row)
-
-        self.pdf_check = QtWidgets.QCheckBox("同时输出 PDF（同名 .pdf）")
-        form.addRow("", self.pdf_check)
-
-        # 尺寸
         size_row = QtWidgets.QHBoxLayout()
         self.width_spin = QtWidgets.QDoubleSpinBox()
         self.width_spin.setRange(2, 40)
@@ -84,16 +97,11 @@ class RenderView(QtWidgets.QWidget):
         self.dpi_spin = QtWidgets.QSpinBox()
         self.dpi_spin.setRange(72, 1200)
         self.dpi_spin.setValue(300)
-        self.line_width_spin = QtWidgets.QDoubleSpinBox()
-        self.line_width_spin.setRange(0.1, 10)
-        self.line_width_spin.setSingleStep(0.1)
-        self.line_width_spin.setValue(1.1)
         size_row.addWidget(QtWidgets.QLabel("宽")); size_row.addWidget(self.width_spin)
         size_row.addWidget(QtWidgets.QLabel("高")); size_row.addWidget(self.height_spin)
         size_row.addWidget(QtWidgets.QLabel("DPI")); size_row.addWidget(self.dpi_spin)
-        size_row.addWidget(QtWidgets.QLabel("线宽")); size_row.addWidget(self.line_width_spin)
         size_row.addWidget(QtWidgets.QWidget(), 1)
-        form.addRow("尺寸：", size_row)
+        form2.addRow("尺寸（英寸）：", size_row)
 
         self.axis_km_check = QtWidgets.QCheckBox("坐标轴用 km")
         self.no_north_check = QtWidgets.QCheckBox("无指北针")
@@ -103,28 +111,53 @@ class RenderView(QtWidgets.QWidget):
         opt_row.addWidget(self.no_north_check)
         opt_row.addWidget(self.no_grid_check)
         opt_row.addWidget(QtWidgets.QWidget(), 1)
-        form.addRow("选项：", opt_row)
+        form2.addRow("选项：", opt_row)
+        left.addWidget(layout_group)
+
+        # 卡 3：输出
+        output_group = QtWidgets.QGroupBox("输出")
+        form3 = QtWidgets.QFormLayout(output_group)
+        form3.setSpacing(8)
+        self.output_png_edit = QtWidgets.QLineEdit()
+        self.output_png_edit.setPlaceholderText("留空自动生成 版本化名_v1_日期.png")
+        png_browse = QtWidgets.QPushButton("浏览…")
+        png_browse.clicked.connect(self._browse_png)
+        png_row = QtWidgets.QHBoxLayout()
+        png_row.addWidget(self.output_png_edit, 1)
+        png_row.addWidget(png_browse)
+        form3.addRow("输出 PNG：", png_row)
+
+        self.pdf_check = QtWidgets.QCheckBox("同时输出 PDF（同名 .pdf）")
+        form3.addRow("", self.pdf_check)
 
         self.confirm_check = QtWidgets.QCheckBox("我已确认输出路径为新文件（不会覆盖既有文件）")
+        form3.addRow("", self.confirm_check)
         self.run_btn = QtWidgets.QPushButton("渲染并校验")
+        self.run_btn.setProperty("kind", "primary")
         self.run_btn.clicked.connect(self._on_run)
-        action_row = QtWidgets.QHBoxLayout()
-        action_row.addWidget(self.confirm_check)
-        action_row.addWidget(self.run_btn, 1)
-        form.addRow("", action_row)
+        form3.addRow("", self.run_btn)
+        left.addWidget(output_group)
+        left.addStretch(1)
 
-        outer.addWidget(form_widget, 1)
+        left_scroll.setWidget(left_widget)
+        body.addWidget(left_scroll, 3)
 
         # 右：预览 + 校验结果
         right = QtWidgets.QVBoxLayout()
-        right.addWidget(QtWidgets.QLabel("PNG 预览："))
+        right.setSpacing(8)
+        preview_group = QtWidgets.QGroupBox("PNG 预览")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
         self.preview = PngPreview()
-        right.addWidget(self.preview, 1)
-        right.addWidget(QtWidgets.QLabel("像素校验："))
+        preview_layout.addWidget(self.preview)
+        right.addWidget(preview_group, 1)
+        verify_group = QtWidgets.QGroupBox("像素校验")
+        verify_layout = QtWidgets.QVBoxLayout(verify_group)
         self.verify_view = JsonTreeView()
-        self.verify_view.setMaximumHeight(180)
-        right.addWidget(self.verify_view)
-        outer.addLayout(right, 1)
+        verify_layout.addWidget(self.verify_view)
+        right.addWidget(verify_group)
+        body.addLayout(right, 2)
+
+        layout.addLayout(body, 1)
 
     def _browse_input(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择分类线 JSON", "", "JSON (*.json)")
@@ -199,7 +232,7 @@ class RenderView(QtWidgets.QWidget):
         alignment.confirm()
         self.run_btn.setEnabled(False)
         self._current_png = out_png
-        start_worker(
+        self._current_worker = start_worker(
             ops.render_classified,
             self.input_edit.text().strip(), out_png, options,
             alignment=alignment,
@@ -209,6 +242,7 @@ class RenderView(QtWidgets.QWidget):
         )
 
     def _on_render_done(self, result: ScriptResult) -> None:
+        self._current_worker = None
         self.run_btn.setEnabled(True)
         if result.json is None:
             self.verify_view.show_raw_text(result.stderr or result.stdout or f"退出码 {result.returncode}")
@@ -216,7 +250,7 @@ class RenderView(QtWidgets.QWidget):
         png_path = result.json.get("output_png", getattr(self, "_current_png", ""))
         self.preview.set_png(png_path)
         # 紧接着像素校验
-        start_worker(
+        self._current_worker = start_worker(
             ops.verify_png, png_path,
             on_finished=self._on_verify_done,
             on_error=self._on_error,
@@ -224,6 +258,7 @@ class RenderView(QtWidgets.QWidget):
         )
 
     def _on_verify_done(self, result: ScriptResult) -> None:
+        self._current_worker = None
         if result.json is not None:
             self.verify_view.show_json(result.json, label="verify_png")
             passed = bool(result.json.get("passed"))
@@ -235,6 +270,7 @@ class RenderView(QtWidgets.QWidget):
             self.verify_view.show_raw_text(result.stderr or result.stdout)
 
     def _on_error(self, msg: str) -> None:
+        self._current_worker = None
         self.run_btn.setEnabled(True)
         self.verify_view.show_raw_text(f"错误：{msg}")
         QtWidgets.QMessageBox.critical(self, "渲染失败", msg)

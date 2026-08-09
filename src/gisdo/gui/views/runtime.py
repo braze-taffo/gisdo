@@ -6,6 +6,8 @@ from PySide6 import QtWidgets
 
 from gisdo.engine import runtime as runtime_mod
 from gisdo.engine.runtime import Runtime
+from gisdo.gui import theme
+from gisdo.gui.widgets import PageHeader
 from gisdo.gui.workers import start_worker
 
 
@@ -16,18 +18,17 @@ class RuntimeView(QtWidgets.QWidget):
         self.log = log
         self._modern_paths: list[str] = []
         self._legacy_paths: list[str] = []
+        self._auto_discovered = False
+        self._current_worker = None
         self._build()
 
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
 
-        bar = QtWidgets.QHBoxLayout()
-        self.discover_btn = QtWidgets.QPushButton("发现运行时")
-        self.discover_btn.clicked.connect(self._on_discover)
-        self.status = QtWidgets.QLabel("尚未发现")
-        bar.addWidget(self.discover_btn)
-        bar.addWidget(self.status, 1)
-        layout.addLayout(bar)
+        layout.addWidget(PageHeader(
+            "运行时", "发现本机 GeoScene/ArcGIS Pro 与 ArcMap Python 环境，选定后供各功能页使用"))
 
         # Pro 运行时
         modern_group = QtWidgets.QGroupBox("GeoScene / ArcGIS Pro 运行时（用于 APRX / GDB / 提取 / 打包）")
@@ -36,9 +37,11 @@ class RuntimeView(QtWidgets.QWidget):
         self.modern_group.setExclusive(True)
         self.modern_radios: list[QtWidgets.QRadioButton] = []
         self.modern_container = QtWidgets.QVBoxLayout()
+        self.modern_container.setSpacing(4)
         modern_layout.addLayout(self.modern_container)
         probe_row = QtWidgets.QHBoxLayout()
         self.probe_btn = QtWidgets.QPushButton("探测选中运行时")
+        self.probe_btn.setProperty("kind", "primary")
         self.probe_btn.clicked.connect(self._on_probe)
         self.probe_btn.setEnabled(False)
         probe_row.addWidget(self.probe_btn)
@@ -46,7 +49,8 @@ class RuntimeView(QtWidgets.QWidget):
         modern_layout.addLayout(probe_row)
         self.probe_summary = QtWidgets.QTextEdit()
         self.probe_summary.setReadOnly(True)
-        self.probe_summary.setMaximumHeight(180)
+        self.probe_summary.setMaximumHeight(170)
+        self.probe_summary.setPlaceholderText("探测结果：产品、扩展、arcpy 版本、工具箱等")
         modern_layout.addWidget(self.probe_summary)
         layout.addWidget(modern_group)
 
@@ -57,16 +61,30 @@ class RuntimeView(QtWidgets.QWidget):
         self.legacy_group.setExclusive(True)
         self.legacy_radios: list[QtWidgets.QRadioButton] = []
         self.legacy_container = QtWidgets.QVBoxLayout()
+        self.legacy_container.setSpacing(4)
         legacy_layout.addLayout(self.legacy_container)
         layout.addWidget(legacy_group)
+
+        # 底部操作行
+        bottom = QtWidgets.QHBoxLayout()
+        self.discover_btn = QtWidgets.QPushButton("重新发现运行时")
+        self.discover_btn.clicked.connect(self._on_discover)
+        bottom.addWidget(self.discover_btn)
+        self.status = QtWidgets.QLabel("尚未发现")
+        self.status.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        bottom.addWidget(self.status, 1)
+        layout.addLayout(bottom)
 
         layout.addStretch(1)
 
         self.modern_group.idToggled.connect(self._on_modern_selected)
         self.legacy_group.idToggled.connect(self._on_legacy_selected)
 
-        # 启动时若有保存的运行时，直接探测一次以确认可用。
-        if self.state.modern is None and self.state.settings.modern_python:
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # 首次显示时自动发现一次（若有保存路径但尚未探测，也借这次发现确认可用）
+        if not self._auto_discovered:
+            self._auto_discovered = True
             self._on_discover()
 
     def _clear_layout(self, layout: QtWidgets.QLayout) -> None:
@@ -79,7 +97,7 @@ class RuntimeView(QtWidgets.QWidget):
     def _on_discover(self) -> None:
         self.discover_btn.setEnabled(False)
         self.status.setText("正在发现…")
-        start_worker(
+        self._current_worker = start_worker(
             runtime_mod.list_runtimes,
             on_finished=self._on_discover_done,
             on_error=self._on_discover_error,
@@ -87,6 +105,7 @@ class RuntimeView(QtWidgets.QWidget):
         )
 
     def _on_discover_done(self, discovery) -> None:
+        self._current_worker = None
         self.discover_btn.setEnabled(True)
         self._modern_paths = list(discovery.modern_candidates)
         self._legacy_paths = list(discovery.legacy_arcmap_candidates)
@@ -98,6 +117,7 @@ class RuntimeView(QtWidgets.QWidget):
             self.status.setText(f"未发现运行时：{discovery.error}")
 
     def _on_discover_error(self, msg: str) -> None:
+        self._current_worker = None
         self.discover_btn.setEnabled(True)
         self.status.setText(f"发现失败：{msg}")
 
@@ -109,6 +129,10 @@ class RuntimeView(QtWidgets.QWidget):
             self.modern_group.addButton(radio, len(self.modern_radios))
             self.modern_container.addWidget(radio)
             self.modern_radios.append(radio)
+        if not self._modern_paths:
+            empty = QtWidgets.QLabel("未发现 Pro 运行时，可在「设置」页手动指定 python.exe")
+            empty.setStyleSheet(f"color: {theme.TEXT_DIM};")
+            self.modern_container.addWidget(empty)
         # 优先选中设置中保存的；否则自动选第一个。
         saved = self.state.settings.modern_python
         for index, path in enumerate(self._modern_paths):
@@ -126,6 +150,10 @@ class RuntimeView(QtWidgets.QWidget):
             self.legacy_group.addButton(radio, len(self.legacy_radios))
             self.legacy_container.addWidget(radio)
             self.legacy_radios.append(radio)
+        if not self._legacy_paths:
+            empty = QtWidgets.QLabel("未发现 ArcMap 运行时（仅处理 MXD/旧数据集时需要）")
+            empty.setStyleSheet(f"color: {theme.TEXT_DIM};")
+            self.legacy_container.addWidget(empty)
         saved = self.state.settings.arcmap_python
         for index, path in enumerate(self._legacy_paths):
             if path == saved:
@@ -152,7 +180,7 @@ class RuntimeView(QtWidgets.QWidget):
         python = self.state.modern.python
         self.probe_btn.setEnabled(False)
         self.probe_summary.setText(f"正在探测 {python} …")
-        start_worker(
+        self._current_worker = start_worker(
             runtime_mod.probe,
             python,
             on_finished=self._on_probe_done,
@@ -161,6 +189,7 @@ class RuntimeView(QtWidgets.QWidget):
         )
 
     def _on_probe_done(self, probe: dict) -> None:
+        self._current_worker = None
         self.probe_btn.setEnabled(True)
         if self.state.modern is not None:
             self.state.modern.family = probe.get("runtime_family", "Pro")
@@ -180,5 +209,6 @@ class RuntimeView(QtWidgets.QWidget):
         self.probe_summary.setText(text)
 
     def _on_probe_error(self, msg: str) -> None:
+        self._current_worker = None
         self.probe_btn.setEnabled(True)
         self.probe_summary.setText(f"探测失败：{msg}")
