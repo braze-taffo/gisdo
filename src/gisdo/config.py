@@ -27,6 +27,7 @@ class Settings:
     ai_base_url: str = ""
     ai_api_key: str = ""
     ai_model: str = ""
+    ai_thinking_level: str = "auto"  # auto | disabled | low | medium | high | max
     autonomy_mode: str = "confirm_writes"  # confirm_writes | autonomous | confirm_every_step
     # 其他
     language: str = "zh"

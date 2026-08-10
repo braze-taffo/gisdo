@@ -17,6 +17,21 @@ from typing import Any, Protocol
 
 from gisdo.engine.runner import RunCancelled
 
+THINKING_AUTO = "auto"
+THINKING_DISABLED = "disabled"
+THINKING_LOW = "low"
+THINKING_MEDIUM = "medium"
+THINKING_HIGH = "high"
+THINKING_MAX = "max"
+THINKING_LEVELS = (
+    THINKING_AUTO,
+    THINKING_DISABLED,
+    THINKING_LOW,
+    THINKING_MEDIUM,
+    THINKING_HIGH,
+    THINKING_MAX,
+)
+
 
 class JsonParseError(ValueError):
     """工具调用参数 JSON 解析失败。"""
@@ -57,6 +72,8 @@ class AssistantMessage:
     """LLM 的一次回复：要么是最终文本（content），要么含工具调用（tool_calls）。"""
 
     content: str | None = None
+    # 思考内容不展示给用户，但思考模式下的工具调用必须在下一轮原样回传。
+    reasoning_content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
 
     @property
@@ -68,6 +85,12 @@ class AssistantMessage:
         msg: dict[str, Any] = {"role": "assistant"}
         if self.content:
             msg["content"] = self.content
+        elif self.reasoning_content is not None and self.tool_calls:
+            # DeepSeek V4 的思考工具调用要求 assistant.content 非 null。
+            msg["content"] = ""
+        if self.reasoning_content is not None and self.tool_calls:
+            # 无工具调用的历史思考无需回传，避免无意义地持久化思维链。
+            msg["reasoning_content"] = self.reasoning_content
         if self.tool_calls:
             msg["tool_calls"] = [tc.to_api() for tc in self.tool_calls]
         return msg
@@ -97,9 +120,57 @@ class LlmConfig:
     api_key: str = ""
     model: str = ""
     timeout: float = 120.0
+    thinking_level: str = THINKING_AUTO
 
     def resolved_api_key(self) -> str:
         return self.api_key or os.environ.get("GISDO_API_KEY", "")
+
+    def normalized_thinking_level(self) -> str:
+        """返回有效思考档位；旧配置或手改坏值按自动处理。"""
+        return self.thinking_level if self.thinking_level in THINKING_LEVELS else THINKING_AUTO
+
+    def thinking_extra_body(self) -> dict[str, Any]:
+        """把统一思考档位转换为当前 OpenAI 兼容端点的透传参数。
+
+        ``auto`` 不发参数，完整保留服务端默认行为。方舟/DeepSeek 使用
+        ``thinking.type``；百炼和 Moonshot 使用 ``enable_thinking``；其他兼容
+        端点使用 OpenAI/Ollama 的 ``reasoning_effort``。具体档位仍以模型支持为准。
+        """
+        level = self.normalized_thinking_level()
+        if level == THINKING_AUTO:
+            return {}
+
+        base_url = self.base_url.lower()
+        model = self.model.lower()
+        uses_enable_thinking = any(
+            marker in base_url
+            for marker in ("dashscope.aliyuncs.com", ".maas.aliyuncs.com", "api.moonshot.cn")
+        )
+        uses_thinking_object = (
+            "volces.com" in base_url
+            or "volcengine" in base_url
+            or "api.deepseek.com" in base_url
+            or model.startswith("deepseek-v4")
+        )
+
+        if uses_enable_thinking:
+            body: dict[str, Any] = {"enable_thinking": level != THINKING_DISABLED}
+        elif uses_thinking_object:
+            body = {
+                "thinking": {
+                    "type": "disabled" if level == THINKING_DISABLED else "enabled",
+                }
+            }
+        else:
+            body = {}
+
+        if level == THINKING_DISABLED:
+            # 标准 reasoning_effort 端点（OpenAI/Ollama）用 none 表示关闭。
+            if not uses_enable_thinking and not uses_thinking_object:
+                body["reasoning_effort"] = "none"
+        else:
+            body["reasoning_effort"] = level
+        return body
 
 
 class LlmError(RuntimeError):
@@ -112,7 +183,11 @@ def _assistant_from_message(message) -> AssistantMessage:
         ToolCall(id=tc.id, name=tc.function.name, arguments=tc.function.arguments or "")
         for tc in (getattr(message, "tool_calls", None) or [])
     ]
-    return AssistantMessage(content=message.content, tool_calls=tool_calls)
+    return AssistantMessage(
+        content=message.content,
+        reasoning_content=getattr(message, "reasoning_content", None),
+        tool_calls=tool_calls,
+    )
 
 
 def _consume_stream(stream, on_token: Callable[[str], None]) -> AssistantMessage:
@@ -123,6 +198,8 @@ def _consume_stream(stream, on_token: Callable[[str], None]) -> AssistantMessage
     ``None``，逐层判空。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    saw_reasoning = False
     pending: dict[int, dict] = {}  # index -> {"id", "name", "arguments"}
     for chunk in stream:
         if not chunk.choices:
@@ -130,6 +207,10 @@ def _consume_stream(stream, on_token: Callable[[str], None]) -> AssistantMessage
         delta = chunk.choices[0].delta
         if delta is None:
             continue
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning is not None:
+            saw_reasoning = True
+            reasoning_parts.append(reasoning)
         if delta.content:
             on_token(delta.content)
             content_parts.append(delta.content)
@@ -148,7 +229,12 @@ def _consume_stream(stream, on_token: Callable[[str], None]) -> AssistantMessage
         for _i, e in sorted(pending.items())
     ]
     content = "".join(content_parts)
-    return AssistantMessage(content=content or None, tool_calls=tool_calls)
+    reasoning_content = "".join(reasoning_parts) if saw_reasoning else None
+    return AssistantMessage(
+        content=content or None,
+        reasoning_content=reasoning_content,
+        tool_calls=tool_calls,
+    )
 
 
 class LlmClient:
@@ -184,8 +270,10 @@ class LlmClient:
             "model": self.config.model,
             "messages": messages,
             "tools": tools or None,
-            "tool_choice": "auto" if tools else None,
         }
+        extra_body = self.config.thinking_extra_body()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         try:
             if on_token is not None:
                 return _consume_stream(
@@ -200,6 +288,13 @@ class LlmClient:
 
 
 __all__ = [
+    "THINKING_AUTO",
+    "THINKING_DISABLED",
+    "THINKING_HIGH",
+    "THINKING_LEVELS",
+    "THINKING_LOW",
+    "THINKING_MAX",
+    "THINKING_MEDIUM",
     "AssistantMessage",
     "ChatFn",
     "JsonParseError",

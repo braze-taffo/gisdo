@@ -28,11 +28,14 @@ def test_seed_does_not_overwrite_existing(tmp_path, monkeypatch):
     assert Settings.load().ai_model == "custom-model"
 
 
+def test_old_settings_default_to_auto_thinking():
+    settings = Settings.from_dict({"ai_model": "legacy-model"})
+    assert settings.ai_thinking_level == "auto"
+
+
 def test_seed_skips_when_model_config_missing(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     # 模拟开源环境：_model_config.py 不存在 -> importlib.import_module 抛 ImportError
-    import sys
-
     def fake_import_module(name):
         if name == "gisdo._model_config":
             raise ImportError("No module named '_model_config'")

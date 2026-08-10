@@ -78,12 +78,13 @@ def test_sanitize_drops_orphan_tool():
 
 def test_sanitize_strips_unfinished_tool_calls():
     clean = sanitize_history([
-        _msg("assistant", content="进行中…",
+        _msg("assistant", content="进行中…", reasoning_content="未完成思考",
              tool_calls=[{"id": "c1", "type": "function",
                           "function": {"name": "x", "arguments": "{}"}}]),
     ])
     assert clean == [{"role": "assistant", "content": "进行中…"}]
     assert "tool_calls" not in clean[0]
+    assert "reasoning_content" not in clean[0]
 
 
 def test_sanitize_drops_tool_after_all_consumed():

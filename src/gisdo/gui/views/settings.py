@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
+from gisdo.agent.llm import (
+    THINKING_AUTO,
+    THINKING_DISABLED,
+    THINKING_HIGH,
+    THINKING_LOW,
+    THINKING_MAX,
+    THINKING_MEDIUM,
+)
 from gisdo.agent.loop import (
     AUTONOMY_AUTONOMOUS,
     AUTONOMY_CONFIRM_EVERY_STEP,
@@ -26,6 +34,15 @@ _AUTONOMY = [
     ("仅写操作确认（推荐）", AUTONOMY_CONFIRM_WRITES),
     ("全程自主", AUTONOMY_AUTONOMOUS),
     ("每步都确认", AUTONOMY_CONFIRM_EVERY_STEP),
+]
+
+_THINKING_LEVELS = [
+    ("自动（遵循模型默认）", THINKING_AUTO),
+    ("关闭（速度优先）", THINKING_DISABLED),
+    ("低（较快）", THINKING_LOW),
+    ("中（均衡）", THINKING_MEDIUM),
+    ("高（质量优先）", THINKING_HIGH),
+    ("极高（模型支持时）", THINKING_MAX),
 ]
 
 
@@ -98,6 +115,15 @@ class SettingsView(QtWidgets.QWidget):
         self.model_edit.setPlaceholderText("如 deepseek-chat / qwen-plus / gpt-4o-mini")
         llm_form.addRow("模型名：", self.model_edit)
 
+        self.thinking_combo = QtWidgets.QComboBox()
+        for label, value in _THINKING_LEVELS:
+            self.thinking_combo.addItem(label, value)
+        self.thinking_combo.setToolTip(
+            "自动：不传思考参数，遵循模型默认；关闭：明确禁用思考以降低延迟；"
+            "低到极高：显式开启并设置强度。实际支持档位取决于模型。"
+        )
+        llm_form.addRow("思考强度：", self.thinking_combo)
+
         self.autonomy_combo = QtWidgets.QComboBox()
         self.autonomy_combo.addItems([label for label, _ in _AUTONOMY])
         llm_form.addRow("自主程度：", self.autonomy_combo)
@@ -148,6 +174,13 @@ class SettingsView(QtWidgets.QWidget):
                 return
         self.autonomy_combo.setCurrentIndex(0)
 
+    def _thinking_value(self) -> str:
+        return self.thinking_combo.currentData() or THINKING_AUTO
+
+    def _set_thinking(self, value: str) -> None:
+        idx = self.thinking_combo.findData(value)
+        self.thinking_combo.setCurrentIndex(max(idx, 0))
+
     def _load(self) -> None:
         s = self.state.settings
         self.modern_edit.setText(s.modern_python)
@@ -156,6 +189,7 @@ class SettingsView(QtWidgets.QWidget):
         self.baseurl_edit.setText(s.ai_base_url)
         self.apikey_edit.setText(s.ai_api_key)
         self.model_edit.setText(s.ai_model)
+        self._set_thinking(s.ai_thinking_level or THINKING_AUTO)
         self._set_autonomy(s.autonomy_mode or AUTONOMY_CONFIRM_WRITES)
 
     def _save(self) -> None:
@@ -166,6 +200,7 @@ class SettingsView(QtWidgets.QWidget):
             ai_base_url=self.baseurl_edit.text().strip(),
             ai_api_key=self.apikey_edit.text().strip(),
             ai_model=self.model_edit.text().strip(),
+            ai_thinking_level=self._thinking_value(),
             autonomy_mode=self._autonomy_value(),
             ai_enabled=bool(self.baseurl_edit.text().strip() and self.model_edit.text().strip()),
         )

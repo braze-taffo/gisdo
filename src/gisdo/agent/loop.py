@@ -83,6 +83,7 @@ def sanitize_history(messages: list[dict]) -> list[dict]:
         for msg in reversed(clean):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 msg.pop("tool_calls", None)
+                msg.pop("reasoning_content", None)
                 break
     return clean
 

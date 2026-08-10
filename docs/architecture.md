@@ -37,7 +37,8 @@ worker 按函数签名注入 `cancel` 与日志回调（ops 用 `on_output`，ru
   真流式：`chat_fn` 支持可选 `on_token` 回调，逐 token 转发；取消经 `cancel` Event 检查抛
   `LlmCancelled(RunCancelled)`，GUI/CLI 停止按钮真正生效。
   历史持久化：`save_history`/`load_history` + `sanitize_history`（修剪孤儿 tool 消息），
-  每项目独立对话历史存 `~/.gisdo/projects/<id>/history.json`。
+  每项目支持多条独立对话，历史存
+  `~/.gisdo/projects/<project-id>/conversations/<conversation-id>.json`。
   项目上下文：`inject_project_context` 把当前项目（项目文件夹/地图输出文件夹）幂等注入系统提示词。
 
 **安全由代码强制，不由 LLM 强制**：Agent 调工具 -> `ops.*` -> `safety`/`alignment`/`preflight` 双层校验。
@@ -90,15 +91,19 @@ arcpy 独立运行时会向前面的 stdout 写 GP 消息，破坏整体 `json.l
 ## 设置持久化
 
 `config.py` 的 `Settings` 数据类（无 GUI 依赖，CLI/GUI 共用）落盘到 `~/.gisdo/settings.json`：
-运行时路径、输出根目录、LLM 配置（`ai_base_url`/`ai_api_key`/`ai_model`）、`autonomy_mode`。
+运行时路径、输出根目录、LLM 配置（`ai_base_url`/`ai_api_key`/`ai_model`/
+`ai_thinking_level`）、`autonomy_mode`。思考强度的 `auto` 不覆盖模型默认行为，`disabled`
+显式关闭，其他档位由 LLM 客户端按方舟/DeepSeek、百炼/Moonshot 或标准 OpenAI 兼容参数转换。
 `gui/state.py` 的 `AppState` import 并 re-export `Settings`，选定运行时后自动回写，
 下次启动 `restore_runtimes()` 恢复。新增字段用默认值，旧 settings.json 仍兼容。
 
 **项目 + 对话管理**：`project.py` 的 `ProjectStore`（无 GUI 依赖）落盘 `~/.gisdo/projects.json`，
-含项目列表与当前激活项目 id；每项目对话历史独立存 `~/.gisdo/projects/<id>/history.json`
+含项目列表、当前激活项目 id，以及各项目的会话元数据和当前会话 id；消息正文独立存到
+`~/.gisdo/projects/<project-id>/conversations/<conversation-id>.json`
 （`Agent.save_history`/`load_history`，格式为除 system 外的完整 OpenAI 消息，加载时经
-`sanitize_history` 修剪孤儿 tool 消息保证合法性）。GUI「项目」页管理项目，切换激活项目即
-切换对话历史（session-per-project）。写工具 `normalize_args` 把省略的输出参数补到当前项目
+`sanitize_history` 修剪孤儿 tool 消息保证合法性）。旧版单一 `history.json` 首次打开时复制
+到默认会话且原文件保留。GUI「项目」页管理项目，Agent 页管理项目内会话；重置只清空当前
+会话。写工具 `normalize_args` 把省略的输出参数补到当前项目
 地图输出文件夹（`versioned_path`/`versioned_file`），对齐块显示补全后路径。
 
 ## 不在范围

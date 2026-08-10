@@ -8,7 +8,7 @@
 
 - **AI Agent 对话**：自然语言下任务，Agent 自主推理 → 调工具 → 看结果 → 下一步，直到完成
 - **真流式输出**：模型回复边生成边显示，「停止」随时打断
-- **项目 + 对话管理**：每个项目配「项目文件夹」与「地图输出文件夹」，写操作默认落点；每项目独立对话历史，切换项目即切换会话（coding harness 式）
+- **项目 + 对话管理**：每个项目配「项目文件夹」与「地图输出文件夹」，写操作默认落点；项目内可新建、切换、重命名、删除多条独立对话
 - **三档自主程度**：仅写操作确认 / 全程自主 / 每步都确认，运行时自由切换
 - **默认对齐**：用户未明确给出所有必要信息时，Agent 先 `ask_user` 与用户对齐（如跨坐标系时选哪个坐标系），不擅作主张
 - **18 个工具**（12 只读 + 6 写）：运行时发现、工程/数据检查、GIS 工具清单实时查询、写操作对齐确认
@@ -57,7 +57,9 @@ cd packaging && python -m PyInstaller gisdo.spec --noconfirm
 gisdo chat --base-url https://api.deepseek.com/v1 --api-key sk-xxx --model deepseek-chat
 ```
 
-或在 GUI 里配好 LLM（「设置」页，支持预设端点）后到「Agent」页用自然语言下任务：
+或在 GUI 里配好 LLM（「设置」页，支持预设端点和思考强度）后到「Agent」页用自然语言下任务。
+思考强度可选自动、关闭、低、中、高、极高；“关闭”会显式禁用模型思考以优先降低延迟，
+其他档位的实际支持范围取决于所选模型：
 
 ```
 你 > 帮我把 D:\proj\foo.aprx 里的数据提取到项目地图输出文件夹
@@ -113,7 +115,7 @@ gisdo project list / new <name> / use <name> / rm <name>
 src/gisdo/
   cli.py                 命令行（含 gisdo chat / gisdo project）
   config.py              设置数据类（无 GUI 依赖，CLI/GUI 共用）
-  project.py             项目注册表 + 对话历史路径（无 GUI 依赖）
+  project.py             项目注册表 + 项目内多会话历史（无 GUI 依赖）
   agent/                 AI Agent 核心（无 PySide6 依赖）
     llm.py               OpenAI 兼容客户端 + 消息类型 + 真流式
     prompt.py            系统提示词（源自 SKILL.md）

@@ -4,7 +4,20 @@
 当护栏。三档自主程度可切换。入口见 :class:`gisdo.agent.loop.Agent`。
 """
 
-from gisdo.agent.llm import AssistantMessage, LlmClient, LlmConfig, LlmError, ToolCall
+from gisdo.agent.llm import (
+    THINKING_AUTO,
+    THINKING_DISABLED,
+    THINKING_HIGH,
+    THINKING_LEVELS,
+    THINKING_LOW,
+    THINKING_MAX,
+    THINKING_MEDIUM,
+    AssistantMessage,
+    LlmClient,
+    LlmConfig,
+    LlmError,
+    ToolCall,
+)
 from gisdo.agent.loop import (
     AUTONOMY_AUTONOMOUS,
     AUTONOMY_CONFIRM_EVERY_STEP,
@@ -23,6 +36,13 @@ __all__ = [
     "AUTONOMY_AUTONOMOUS",
     "AUTONOMY_CONFIRM_EVERY_STEP",
     "AUTONOMY_CONFIRM_WRITES",
+    "THINKING_AUTO",
+    "THINKING_DISABLED",
+    "THINKING_HIGH",
+    "THINKING_LEVELS",
+    "THINKING_LOW",
+    "THINKING_MAX",
+    "THINKING_MEDIUM",
     "Agent",
     "AgentCallbacks",
     "AssistantMessage",

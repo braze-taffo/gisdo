@@ -38,7 +38,13 @@ from gisdo.engine.runner import RunCancelled, ScriptResult
 from gisdo.engine.runtime import Runtime
 from gisdo.engine.safety import SafetyError
 from gisdo.engine.versioning import versioned_path
-from gisdo.project import GisProject, ProjectStore, history_path
+from gisdo.project import (
+    DEFAULT_CONVERSATION_TITLE,
+    GisProject,
+    ProjectStore,
+    conversation_history_path,
+    history_path,
+)
 
 # --------------------------------------------------------------------------- #
 # 运行时解析
@@ -460,7 +466,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
     if not base_url or not model:
         _die("未配置 LLM。请用 --base-url/--model 指定，或在 GUI 设置里填写后重试。")
 
-    config = LlmConfig(base_url=base_url, api_key=api_key, model=model)
+    config = LlmConfig(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        thinking_level=settings.ai_thinking_level,
+    )
     client = LlmClient(config)
 
     import threading
@@ -468,7 +479,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
     modern = _try_modern(args)
     arcmap = _try_arcmap(args)
     proj = _resolve_project(args)
-    history_file = str(history_path(proj.id)) if proj is not None else None
+    conversation = None
+    project_store = None
+    history_file = None
+    if proj is not None:
+        project_store = ProjectStore.load()
+        conversation = project_store.ensure_current_conversation(proj.id)
+        history_file = str(conversation_history_path(proj.id, conversation.id))
     ctx = ToolContext(modern_runtime=modern, arcmap_runtime=arcmap, cancel=cancel,
                       on_log=lambda line: print(f"   │ {line}"),
                       project=proj)
@@ -530,7 +547,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
     rt_info = f"现代运行时={'有' if modern else '无'}，ArcMap={'有' if arcmap else '无'}"
     proj_info = f"项目={proj.name if proj else '无'}"
-    print(f"GISdo Agent 就绪。模型={model}，自主={args.autonomy}，{rt_info}，{proj_info}。")
+    conversation_info = f"，对话={conversation.title}" if conversation is not None else ""
+    print(
+        f"GISdo Agent 就绪。模型={model}，思考={settings.ai_thinking_level}，"
+        f"自主={args.autonomy}，{rt_info}，{proj_info}{conversation_info}。"
+    )
     if modern:
         inventory = build_tool_inventory(modern)
         if inventory:
@@ -556,11 +577,21 @@ def cmd_chat(args: argparse.Namespace) -> int:
             print("已清空对话历史。")
             continue
         try:
+            if (
+                project_store is not None
+                and conversation is not None
+                and conversation.title == DEFAULT_CONVERSATION_TITLE
+            ):
+                conversation = project_store.rename_conversation(
+                    proj.id, conversation.id, user
+                )
             agent.run(user)
             if history_file:
                 _save_history_file(history_file, [
                     m for m in agent.history if m.get("role") != "system"
                 ])
+            if project_store is not None and conversation is not None:
+                project_store.touch_conversation(proj.id, conversation.id)
         except RunCancelled:  # 覆盖 LlmCancelled
             print("\n⚠️ 已取消。")
         except KeyboardInterrupt:

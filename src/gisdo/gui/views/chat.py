@@ -37,13 +37,25 @@ from gisdo.gui import theme
 from gisdo.gui.icons import get_icon
 from gisdo.gui.markdown import render_markdown
 from gisdo.gui.widgets import LogConsole, PageHeader
-from gisdo.project import history_path
+from gisdo.project import (
+    DEFAULT_CONVERSATION_TITLE,
+    conversation_history_path,
+)
 
 _AUTONOMY_ITEMS = [
     ("仅写操作确认", AUTONOMY_CONFIRM_WRITES),
     ("全程自主", AUTONOMY_AUTONOMOUS),
     ("每步都确认", AUTONOMY_CONFIRM_EVERY_STEP),
 ]
+
+_THINKING_LABELS = {
+    "auto": "自动",
+    "disabled": "关闭",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "max": "极高",
+}
 
 _SPACING = '<p style="font-size:5px">&nbsp;</p>'
 
@@ -148,6 +160,9 @@ class ChatView(QtWidgets.QWidget):
         self.state = state
         self.log = log
         self._agent: Agent | None = None
+        self._agent_history_path: str | None = None
+        self._agent_project_id: str | None = None
+        self._agent_conversation_id: str | None = None
         self._signals = _ChatSignals()
         self._cancel = threading.Event()
         self._confirm_event = threading.Event()
@@ -176,6 +191,29 @@ class ChatView(QtWidgets.QWidget):
         self.project_chip.setVisible(False)
         self.header.add_widget(self.project_chip)
         layout.addWidget(self.header)
+
+        conversation_bar = QtWidgets.QHBoxLayout()
+        conversation_bar.setSpacing(8)
+        conversation_bar.addWidget(QtWidgets.QLabel("当前对话："))
+        self.conversation_combo = QtWidgets.QComboBox()
+        self.conversation_combo.setMinimumWidth(220)
+        self.conversation_combo.currentIndexChanged.connect(self._on_conversation_selected)
+        conversation_bar.addWidget(self.conversation_combo, 1)
+        self.new_conversation_btn = QtWidgets.QPushButton(
+            get_icon("plus", theme.TEXT), "新建对话"
+        )
+        self.new_conversation_btn.clicked.connect(self._on_new_conversation)
+        conversation_bar.addWidget(self.new_conversation_btn)
+        self.rename_conversation_btn = QtWidgets.QPushButton("重命名")
+        self.rename_conversation_btn.clicked.connect(self._on_rename_conversation)
+        conversation_bar.addWidget(self.rename_conversation_btn)
+        self.delete_conversation_btn = QtWidgets.QPushButton(
+            get_icon("trash", theme.DANGER), "删除"
+        )
+        self.delete_conversation_btn.setProperty("kind", "danger")
+        self.delete_conversation_btn.clicked.connect(self._on_delete_conversation)
+        conversation_bar.addWidget(self.delete_conversation_btn)
+        layout.addLayout(conversation_bar)
 
         bar = QtWidgets.QHBoxLayout()
         bar.setSpacing(8)
@@ -297,7 +335,8 @@ class ChatView(QtWidgets.QWidget):
         s.confirm_requested.connect(self._on_confirm_requested)
         s.ask_requested.connect(self._on_ask_requested)
         self.state.current_project_changed.connect(self._on_project_changed)
-        self.state.settings_changed.connect(lambda *_: self._on_prereq_changed())
+        self.state.conversations_changed.connect(self._refresh_conversation_combo)
+        self.state.settings_changed.connect(self._on_settings_changed)
         self.state.modern_runtime_changed.connect(lambda *_: self._on_prereq_changed())
 
     # --- 前置条件与引导 ---
@@ -339,6 +378,13 @@ class ChatView(QtWidgets.QWidget):
         else:
             self._refresh_onboarding()
             self._update_stack_page()
+
+    def _on_settings_changed(self, *_args) -> None:
+        """模型设置保存后重建 Agent，使新思考档位从下一条消息起生效。"""
+        if self._busy:
+            self._pending_reload = True
+            return
+        self._reload_project_ui()
 
     # --- 对话显示 ---
     def _default_char_format(self) -> QtGui.QTextCharFormat:
@@ -413,10 +459,123 @@ class ChatView(QtWidgets.QWidget):
         """取消/异常收尾：把未闭合的原始文本块升级为气泡。"""
         self._replace_stream_block(text)
 
-    # --- 项目关联 ---
+    # --- 项目与会话关联 ---
     def _history_path(self) -> str | None:
         proj = self.state.current_project
-        return str(history_path(proj.id)) if proj is not None else None
+        conversation = self.state.ensure_current_conversation()
+        if proj is None or conversation is None:
+            return None
+        return str(conversation_history_path(proj.id, conversation.id))
+
+    def _save_active_agent_history(self) -> None:
+        """把当前 Agent 保存到它创建时绑定的会话，避免切换后串写。"""
+        if self._agent is None or not self._agent_history_path:
+            return
+        if self._agent_project_id is not None:
+            if self.state._store.get(self._agent_project_id) is None:
+                return  # 项目已删除，不重新创建其目录
+            if (
+                self._agent_conversation_id is not None
+                and self.state._store.get_conversation(
+                    self._agent_project_id, self._agent_conversation_id
+                )
+                is None
+            ):
+                return  # 会话已删除，不重新创建其历史文件
+        try:
+            self._agent.save_history(self._agent_history_path)
+        except OSError:
+            pass
+
+    def _refresh_conversation_combo(self, *_args) -> None:
+        current = self.state.current_conversation
+        current_id = current.id if current is not None else None
+        self.conversation_combo.blockSignals(True)
+        self.conversation_combo.clear()
+        # 最近使用的会话靠前；当前项仍按 id 精确恢复。
+        conversations = sorted(
+            self.state.conversations,
+            key=lambda item: item.updated_at or item.created_at,
+            reverse=True,
+        )
+        for conversation in conversations:
+            self.conversation_combo.addItem(conversation.title, conversation.id)
+            idx = self.conversation_combo.count() - 1
+            self.conversation_combo.setItemData(
+                idx,
+                f"创建：{conversation.created_at}\n更新：{conversation.updated_at}",
+                QtCore.Qt.ItemDataRole.ToolTipRole,
+            )
+        if current_id is not None:
+            idx = self.conversation_combo.findData(current_id)
+            if idx >= 0:
+                self.conversation_combo.setCurrentIndex(idx)
+        self.conversation_combo.blockSignals(False)
+        available = current is not None and not self._busy
+        self.conversation_combo.setEnabled(available)
+        self.rename_conversation_btn.setEnabled(available)
+        self.delete_conversation_btn.setEnabled(available)
+        self.new_conversation_btn.setEnabled(self.state.current_project is not None and not self._busy)
+
+    def _on_conversation_selected(self, _index: int) -> None:
+        if self._busy:
+            self._refresh_conversation_combo()
+            return
+        conversation_id = self.conversation_combo.currentData()
+        current = self.state.current_conversation
+        if not conversation_id or (current is not None and current.id == conversation_id):
+            return
+        self._save_active_agent_history()
+        if self.state.set_current_conversation(conversation_id) is not None:
+            self._reload_project_ui(save_current=False)
+
+    def _on_new_conversation(self) -> None:
+        if self._busy or self.state.current_project is None:
+            return
+        title, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "新建对话",
+            "对话名称：",
+            text=DEFAULT_CONVERSATION_TITLE,
+        )
+        if not ok:
+            return
+        self._save_active_agent_history()
+        if self.state.create_conversation(title) is not None:
+            self._reload_project_ui(save_current=False)
+
+    def _on_rename_conversation(self) -> None:
+        conversation = self.state.current_conversation
+        if self._busy or conversation is None:
+            return
+        title, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "重命名对话",
+            "对话名称：",
+            text=conversation.title,
+        )
+        if ok and title.strip():
+            self.state.rename_conversation(conversation.id, title)
+
+    def _on_delete_conversation(self) -> None:
+        conversation = self.state.current_conversation
+        if self._busy or conversation is None:
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "删除对话",
+            f"删除对话「{conversation.title}」及其全部历史？此操作不可撤销。",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._agent = None  # 防止刷新时把刚删除的历史重新写回
+        self._agent_history_path = None
+        self._agent_project_id = None
+        self._agent_conversation_id = None
+        if self.state.delete_conversation(conversation.id) is not None:
+            self._reload_project_ui(save_current=False)
 
     def _on_project_changed(self, _project) -> None:
         if self._busy:
@@ -424,40 +583,42 @@ class ChatView(QtWidgets.QWidget):
             return
         self._reload_project_ui()
 
-    def _reload_project_ui(self) -> None:
-        # 旧 Agent 若存在，先落盘其历史到旧项目路径
-        old_path = None
-        if self._agent is not None:
-            proj = getattr(self._agent.ctx, "project", None)
-            if proj is not None:
-                old_path = str(history_path(proj.id))
-        if self._agent is not None and old_path:
-            try:
-                self._agent.save_history(old_path)
-            except OSError:
-                pass
+    def _reload_project_ui(self, *, save_current: bool = True) -> None:
+        if save_current:
+            self._save_active_agent_history()
         self._agent = None
+        self._agent_history_path = None
+        self._agent_project_id = None
+        self._agent_conversation_id = None
         self._stream_open = False
         self._cancel.clear()
         self.view.clear()
         proj = self.state.current_project
         self.project_chip.setVisible(proj is not None)
         if proj is not None:
+            conversation = self.state.ensure_current_conversation()
+            self._refresh_conversation_combo()
             self.project_chip.setText(f"项目：{proj.name}")
-            loaded = self._load_history_messages(proj.id)
+            current_path = self._history_path()
+            loaded = self._load_history_messages(current_path)
             self._insert(_info_line(
                 f'当前项目：{html.escape(proj.name)}'
+                f' · 对话：{html.escape(conversation.title if conversation else "新对话")}'
                 f'（地图输出：{html.escape(proj.map_output_dir or "未设置")}）'
             ))
             if loaded:
                 self._render_transcript(loaded)
+        else:
+            self._refresh_conversation_combo()
         self._refresh_onboarding()
         self._update_stack_page()
 
-    def _load_history_messages(self, project_id: str):
+    def _load_history_messages(self, path: str | None):
         from pathlib import Path
 
-        p = Path(history_path(project_id))
+        if not path:
+            return []
+        p = Path(path)
         if not p.is_file():
             return []
         try:
@@ -531,6 +692,11 @@ class ChatView(QtWidgets.QWidget):
         agent = self._ensure_agent()
         if agent is None:
             return
+        conversation = self.state.current_conversation
+        if conversation is not None and conversation.title == DEFAULT_CONVERSATION_TITLE:
+            conversation = self.state.rename_conversation(conversation.id, text)
+        elif conversation is not None:
+            self.state.touch_conversation(conversation.id)
         self._insert(_user_bubble(html.escape(text).replace("\n", "<br/>")))
         self.input.clear()
         self._set_busy(True)
@@ -550,7 +716,12 @@ class ChatView(QtWidgets.QWidget):
             self._update_stack_page()
             return None
         s = self.state.settings
-        config = LlmConfig(base_url=s.ai_base_url, api_key=s.ai_api_key, model=s.ai_model)
+        config = LlmConfig(
+            base_url=s.ai_base_url,
+            api_key=s.ai_api_key,
+            model=s.ai_model,
+            thinking_level=s.ai_thinking_level,
+        )
         client = LlmClient(config)
         proj = self.state.current_project
         ctx = ToolContext(
@@ -588,12 +759,18 @@ class ChatView(QtWidgets.QWidget):
         self._agent = Agent(client.chat, ctx, callbacks=callbacks, autonomy=autonomy,
                             cancel=self._cancel)
         if proj is not None:
+            conversation = self.state.ensure_current_conversation()
+            self._agent_project_id = proj.id
+            self._agent_conversation_id = conversation.id if conversation is not None else None
+            self._agent_history_path = self._history_path()
             self._agent.inject_project_context(format_project_context(proj))
-            loaded = self._load_history_messages(proj.id)
+            loaded = self._load_history_messages(self._agent_history_path)
             if loaded:
                 self._agent.load_history(loaded)
         self._insert(_info_line(
-            f'Agent 就绪：模型={html.escape(s.ai_model)}，自主={autonomy}，'
+            f'Agent 就绪：模型={html.escape(s.ai_model)}，'
+            f'思考={_THINKING_LABELS.get(s.ai_thinking_level, "自动")}，'
+            f'自主={autonomy}，'
             f'现代运行时={"有" if self.state.modern else "无"}，'
             f'项目={html.escape(proj.name if proj else "无")}。'
         ))
@@ -607,8 +784,11 @@ class ChatView(QtWidgets.QWidget):
         if self._busy:
             return
         self._agent = None
+        self._agent_history_path = None
+        self._agent_project_id = None
+        self._agent_conversation_id = None
         self.view.clear()
-        self._insert(_info_line("已重置。下一条消息会重建 Agent（拾取最新运行时/设置）。"))
+        self._insert(_info_line("已清空当前对话。项目内其他对话不受影响。"))
         hp = self._history_path()
         if hp:
             try:
@@ -642,6 +822,7 @@ class ChatView(QtWidgets.QWidget):
         self._busy = busy
         self.stop_btn.setEnabled(busy)
         self.reset_btn.setEnabled(not busy)
+        self._refresh_conversation_combo()
         if not busy:
             self.chat_stack.setCurrentIndex(1)  # 有对话后固定在对话页
         self._update_stack_page()

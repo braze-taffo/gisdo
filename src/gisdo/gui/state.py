@@ -13,7 +13,12 @@ import shutil
 from PySide6 import QtCore
 
 from gisdo.config import SETTINGS_DIR, SETTINGS_FILE, Settings
-from gisdo.project import GisProject, ProjectStore
+from gisdo.project import (
+    DEFAULT_CONVERSATION_TITLE,
+    Conversation,
+    GisProject,
+    ProjectStore,
+)
 
 __all__ = ["SETTINGS_DIR", "SETTINGS_FILE", "AppState", "Settings"]
 
@@ -27,6 +32,8 @@ class AppState(QtCore.QObject):
     settings_changed = QtCore.Signal(object)  # Settings
     projects_changed = QtCore.Signal(object)  # list[GisProject]
     current_project_changed = QtCore.Signal(object)  # GisProject | None
+    conversations_changed = QtCore.Signal(object)  # list[Conversation]
+    current_conversation_changed = QtCore.Signal(object)  # Conversation | None
 
     def __init__(self) -> None:
         super().__init__()
@@ -114,11 +121,88 @@ class AppState(QtCore.QObject):
         shutil.rmtree(PROJECTS_DIR / project_id, ignore_errors=True)
         self.projects_changed.emit(self.projects)
         self.current_project_changed.emit(self._store.current())
+        self.conversations_changed.emit(self.conversations)
+        self.current_conversation_changed.emit(self.current_conversation)
         return removed
 
     def set_current_project(self, project: GisProject | None) -> None:
         self._store.set_current(project.id if project is not None else None)
+        if project is not None:
+            self._store.ensure_current_conversation(project.id)
         self.current_project_changed.emit(self._store.current())
+        self.conversations_changed.emit(self.conversations)
+        self.current_conversation_changed.emit(self.current_conversation)
+
+    # --- conversations ---
+    @property
+    def conversations(self) -> list[Conversation]:
+        project = self.current_project
+        return self._store.conversations_for(project.id) if project is not None else []
+
+    @property
+    def current_conversation(self) -> Conversation | None:
+        project = self.current_project
+        return self._store.current_conversation(project.id) if project is not None else None
+
+    def ensure_current_conversation(self) -> Conversation | None:
+        project = self.current_project
+        if project is None:
+            return None
+        before = self._store.current_conversation(project.id)
+        conversation = self._store.ensure_current_conversation(project.id)
+        if before is None:
+            self.conversations_changed.emit(self.conversations)
+            self.current_conversation_changed.emit(conversation)
+        return conversation
+
+    def create_conversation(self, title: str = DEFAULT_CONVERSATION_TITLE) -> Conversation | None:
+        project = self.current_project
+        if project is None:
+            return None
+        conversation = self._store.create_conversation(project.id, title)
+        self.conversations_changed.emit(self.conversations)
+        self.current_conversation_changed.emit(conversation)
+        return conversation
+
+    def rename_conversation(self, conversation_id: str, title: str) -> Conversation | None:
+        project = self.current_project
+        if project is None:
+            return None
+        conversation = self._store.rename_conversation(project.id, conversation_id, title)
+        if conversation is not None:
+            self.conversations_changed.emit(self.conversations)
+        return conversation
+
+    def touch_conversation(self, conversation_id: str) -> Conversation | None:
+        project = self.current_project
+        if project is None:
+            return None
+        conversation = self._store.touch_conversation(project.id, conversation_id)
+        if conversation is not None:
+            self.conversations_changed.emit(self.conversations)
+        return conversation
+
+    def set_current_conversation(self, conversation_id: str) -> Conversation | None:
+        project = self.current_project
+        if project is None:
+            return None
+        conversation = self._store.set_current_conversation(project.id, conversation_id)
+        if conversation is not None:
+            self.current_conversation_changed.emit(conversation)
+        return conversation
+
+    def delete_conversation(self, conversation_id: str) -> Conversation | None:
+        project = self.current_project
+        if project is None:
+            return None
+        removed = self._store.delete_conversation(project.id, conversation_id)
+        if removed is None:
+            return None
+        if not self._store.conversations_for(project.id):
+            self._store.create_conversation(project.id)
+        self.conversations_changed.emit(self.conversations)
+        self.current_conversation_changed.emit(self.current_conversation)
+        return removed
 
     # --- settings ---
     def update_settings(self, **kwargs) -> None:
