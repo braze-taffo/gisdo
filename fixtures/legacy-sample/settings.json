@@ -1,0 +1,13 @@
+{
+  "modern_python": "C:\\Program Files\\GeoScene\\Pro\\bin\\Python\\envs\\arcgispro-py3\\python.exe",
+  "arcmap_python": "C:\\Python27\\ArcGIS10.8\\python.exe",
+  "output_root": "E:\\outputs",
+  "ai_enabled": true,
+  "ai_base_url": "https://example.invalid/v1",
+  "ai_api_key": "fixture-secret-must-never-enter-sqlite",
+  "ai_model": "fixture-model",
+  "ai_thinking_level": "medium",
+  "autonomy_mode": "confirm_writes",
+  "language": "zh"
+}
+

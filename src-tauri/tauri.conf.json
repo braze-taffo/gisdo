@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GISdo",
+  "version": "0.2.0",
+  "identifier": "com.gisdo.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "GISdo",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1060,
+        "minHeight": 700,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true,
+        "backgroundColor": "#07110f"
+      }
+    ],
+    "security": { "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "publisher": "GISdo",
+    "licenseFile": "../LICENSE",
+    "category": "GraphicsAndDesign",
+    "shortDescription": "面向 ArcGIS 的智能地理处理与制图桌面应用",
+    "longDescription": "GISdo 可以读取项目资料、检查 GIS 数据并协调 ArcGIS Pro 或 ArcMap 完成地理处理、制图与结果校验。",
+    "resources": {
+      "../workers/arcmap/worker_server.py": "workers/arcmap/worker_server.py",
+      "../workers/common/worker_core.py": "workers/common/worker_core.py",
+      "../workers/legacy/legacy_runner.py": "workers/legacy/legacy_runner.py",
+      "../workers/pro/worker_server.py": "workers/pro/worker_server.py",
+      "../skills/": "skills/",
+      "../fixtures/arcgis_tool_inventory_510.json": "fixtures/arcgis_tool_inventory_510.json"
+    },
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "startMenuFolder": "GISdo"
+      },
+      "wix": { "language": ["zh-CN", "en-US"] }
+    }
+  }
+}

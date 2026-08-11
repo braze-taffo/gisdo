@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { font-family: Inter, "Segoe UI", "Microsoft YaHei UI", sans-serif; color-scheme: dark; font-synthesis: none; text-rendering: optimizeLegibility; }
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; }
+body { overflow: hidden; background: #07110f; }
+button, input, textarea, select { font: inherit; }
+button { -webkit-tap-highlight-color: transparent; }
+::selection { background: rgba(117, 240, 193, .26); color: white; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { border: 3px solid transparent; border-radius: 99px; background: #254239; background-clip: padding-box; }
+
+@layer components {
+  .field { @apply h-11 w-full rounded-xl border border-line bg-black/20 px-3 text-sm text-[#e6f0ec] outline-none transition placeholder:text-[#496159] focus:border-mint/45 focus:ring-2 focus:ring-mint/10; }
+  .markdown-body h1 { @apply mb-4 mt-7 text-2xl font-semibold tracking-tight text-white; }
+  .markdown-body h2 { @apply mb-3 mt-7 text-xl font-semibold tracking-tight text-white; }
+  .markdown-body h3 { @apply mb-2 mt-6 text-base font-semibold text-white; }
+  .markdown-body p { @apply my-3; }
+  .markdown-body ul { @apply my-3 list-disc space-y-1 pl-6; }
+  .markdown-body ol { @apply my-3 list-decimal space-y-1 pl-6; }
+  .markdown-body strong { @apply font-semibold text-[#f1faf7]; }
+  .markdown-body code { @apply rounded-md border border-line bg-black/25 px-1.5 py-0.5 font-mono text-[.88em] text-[#a8f6d6]; }
+  .markdown-body pre { @apply my-4 overflow-auto rounded-xl border border-line bg-black/30 p-4; }
+  .markdown-body pre code { @apply border-0 bg-transparent p-0 text-xs; }
+  .markdown-body blockquote { @apply my-4 border-l-2 border-lime/60 bg-lime/[.035] py-2 pl-4 text-[#b8c8c2]; }
+  .markdown-body table { @apply my-5 w-full border-collapse overflow-hidden rounded-xl text-left text-xs; }
+  .markdown-body th { @apply border border-line bg-white/5 px-3 py-2 font-semibold text-white; }
+  .markdown-body td { @apply border border-line px-3 py-2 text-[#bdcec8]; }
+  .markdown-body a { @apply text-mint underline decoration-mint/30 underline-offset-4 hover:decoration-mint; }
+}
+

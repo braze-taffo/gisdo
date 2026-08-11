@@ -1,0 +1,4 @@
+interface:
+  display_name: "Document Intake"
+  short_description: "Read project documents and turn them into executable GIS plans"
+  default_prompt: "Use $document-intake to read this roadmap and supporting material, then plan the GIS deliverables."

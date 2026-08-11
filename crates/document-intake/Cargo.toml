@@ -1,0 +1,16 @@
+[package]
+name = "gisdo-document-intake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+calamine.workspace = true
+pdf-extract.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

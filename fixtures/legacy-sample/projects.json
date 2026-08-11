@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "current_project_id": "731538ba0e4a4db2bbded2303c46d32b",
+  "projects": [
+    {
+      "id": "731538ba0e4a4db2bbded2303c46d32b",
+      "name": "迁移样例",
+      "project_dir": "E:\\GIS\\sample",
+      "map_output_dir": "E:\\GIS\\sample\\outputs",
+      "created_at": "2026-08-11T00:00:00+00:00",
+      "conversations": []
+    }
+  ]
+}
+

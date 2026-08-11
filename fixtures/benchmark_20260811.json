@@ -1,0 +1,36 @@
+{
+  "benchmark_version": 1,
+  "date": "2026-08-11",
+  "kind": "real ArcPy persistent-worker batch benchmark",
+  "runtime": {
+    "python": "3.11.11",
+    "arcpy": "11.5"
+  },
+  "input_count": 473761,
+  "steps": [
+    {
+      "tool": "management.Project",
+      "duration_ms": 47341,
+      "output_count": 473761,
+      "epsg": 4326
+    },
+    {
+      "tool": "analysis.Clip",
+      "duration_ms": 1437,
+      "output_count": 3913,
+      "epsg": 4326,
+      "extent": {
+        "xmin": 113.42051914130863,
+        "ymin": 23.428589053216825,
+        "xmax": 113.94745840976799,
+        "ymax": 23.812745464436652
+      }
+    }
+  ],
+  "worker_ready_ms": 23412,
+  "warm_batch_execution_ms": 48902,
+  "cold_total_ms": 72606,
+  "standalone_get_count_calls": 0,
+  "result": "passed",
+  "output_root": "D:\\GISdoNext_Benchmark_v3_20260811"
+}
