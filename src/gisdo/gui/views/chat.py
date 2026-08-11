@@ -74,8 +74,8 @@ def _user_bubble(content_html: str) -> str:
 def _agent_bubble(content_html: str) -> str:
     return (
         f'<table width="100%" border="0" cellspacing="0" cellpadding="8"><tr>'
-        f'<td bgcolor="{theme.BG}">'
-        f'<span style="color:{theme.TEXT};font-weight:600">🤖 Agent</span><br/>'
+        f'<td bgcolor="{theme.SURFACE_ALT}">'
+        f'<span style="color:{theme.TEXT};font-weight:600">✦ GISdo Agent</span><br/>'
         f'{content_html}</td>'
         f'<td width="18%"></td>'
         f'</tr></table>' + _SPACING
@@ -173,6 +173,7 @@ class ChatView(QtWidgets.QWidget):
         self._current_worker = None
         self._stream_open = False
         self._stream_start = 0
+        self._stream_end = 0
         self._stream_text = ""
         self._pending_reload = False
         self._build()
@@ -182,8 +183,8 @@ class ChatView(QtWidgets.QWidget):
     # --- UI ---
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(12)
 
         self.header = PageHeader("Agent 对话", "用自然语言描述 GIS 任务，Agent 自动调用工具完成")
         self.project_chip = QtWidgets.QLabel()
@@ -192,11 +193,19 @@ class ChatView(QtWidgets.QWidget):
         self.header.add_widget(self.project_chip)
         layout.addWidget(self.header)
 
+        toolbar_panel = QtWidgets.QFrame()
+        toolbar_panel.setObjectName("chatToolbar")
+        toolbar_layout = QtWidgets.QVBoxLayout(toolbar_panel)
+        toolbar_layout.setContentsMargins(12, 10, 12, 10)
+        toolbar_layout.setSpacing(8)
+
         conversation_bar = QtWidgets.QHBoxLayout()
         conversation_bar.setSpacing(8)
-        conversation_bar.addWidget(QtWidgets.QLabel("当前对话："))
+        conversation_label = QtWidgets.QLabel("当前对话")
+        conversation_label.setObjectName("fieldLabel")
+        conversation_bar.addWidget(conversation_label)
         self.conversation_combo = QtWidgets.QComboBox()
-        self.conversation_combo.setMinimumWidth(220)
+        self.conversation_combo.setMinimumWidth(260)
         self.conversation_combo.currentIndexChanged.connect(self._on_conversation_selected)
         conversation_bar.addWidget(self.conversation_combo, 1)
         self.new_conversation_btn = QtWidgets.QPushButton(
@@ -213,11 +222,13 @@ class ChatView(QtWidgets.QWidget):
         self.delete_conversation_btn.setProperty("kind", "danger")
         self.delete_conversation_btn.clicked.connect(self._on_delete_conversation)
         conversation_bar.addWidget(self.delete_conversation_btn)
-        layout.addLayout(conversation_bar)
+        toolbar_layout.addLayout(conversation_bar)
 
         bar = QtWidgets.QHBoxLayout()
         bar.setSpacing(8)
-        bar.addWidget(QtWidgets.QLabel("自主程度："))
+        autonomy_label = QtWidgets.QLabel("自主程度")
+        autonomy_label.setObjectName("fieldLabel")
+        bar.addWidget(autonomy_label)
         self.autonomy_combo = QtWidgets.QComboBox()
         for label, _value in _AUTONOMY_ITEMS:
             self.autonomy_combo.addItem(label)
@@ -238,10 +249,12 @@ class ChatView(QtWidgets.QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop)
         bar.addWidget(self.stop_btn)
-        layout.addLayout(bar)
+        toolbar_layout.addLayout(bar)
+        layout.addWidget(toolbar_panel)
 
         # 对话区 / 引导卡
         self.chat_stack = QtWidgets.QStackedWidget()
+        self.chat_stack.setObjectName("chatStack")
         self._build_onboarding()
         self.chat_stack.addWidget(self.onboarding)  # index 0
 
@@ -257,37 +270,45 @@ class ChatView(QtWidgets.QWidget):
         self.tool_log.setVisible(False)
         layout.addWidget(self.tool_log)
 
-        input_row = QtWidgets.QHBoxLayout()
+        composer = QtWidgets.QFrame()
+        composer.setObjectName("composer")
+        input_row = QtWidgets.QHBoxLayout(composer)
+        input_row.setContentsMargins(6, 5, 6, 5)
         input_row.setSpacing(8)
         self.input = QtWidgets.QPlainTextEdit()
-        self.input.setFixedHeight(64)
+        self.input.setObjectName("chatInput")
+        self.input.setFixedHeight(72)
         self.input.setPlaceholderText("用自然语言描述任务，回车发送，Shift+回车换行…")
         self.input.installEventFilter(self)
         input_row.addWidget(self.input, 1)
         self.send_btn = QtWidgets.QPushButton(get_icon("send", "#FFFFFF"), "发送")
         self.send_btn.setProperty("kind", "primary")
         self.send_btn.setDefault(True)
-        self.send_btn.setFixedHeight(40)
+        self.send_btn.setFixedSize(92, 44)
         self.send_btn.clicked.connect(self._on_send)
-        input_row.addWidget(self.send_btn)
-        layout.addLayout(input_row)
+        input_row.addWidget(self.send_btn, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
+        layout.addWidget(composer)
 
     def _build_onboarding(self) -> None:
         panel = QtWidgets.QWidget()
         outer = QtWidgets.QVBoxLayout(panel)
+        outer.setContentsMargins(14, 14, 14, 14)
         outer.addStretch(1)
         card = QtWidgets.QFrame()
-        card.setObjectName("card")
-        card.setMaximumWidth(560)
+        card.setObjectName("onboardingCard")
+        card.setMaximumWidth(640)
         card_layout = QtWidgets.QVBoxLayout(card)
-        card_layout.setContentsMargins(28, 22, 28, 22)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(32, 28, 32, 28)
+        card_layout.setSpacing(12)
 
-        title = QtWidgets.QLabel("开始使用 Agent")
-        title.setStyleSheet(f"font-size:16px; font-weight:700; color:{theme.TEXT};")
+        eyebrow = QtWidgets.QLabel("开始之前")
+        eyebrow.setObjectName("onboardingEyebrow")
+        card_layout.addWidget(eyebrow)
+        title = QtWidgets.QLabel("让 Agent 接手你的 GIS 工作流")
+        title.setObjectName("onboardingTitle")
         card_layout.addWidget(title)
         hint = QtWidgets.QLabel("Agent 需要以下三项就绪后才能工作：")
-        hint.setStyleSheet(f"color:{theme.TEXT_DIM};")
+        hint.setObjectName("onboardingHint")
         card_layout.addWidget(hint)
 
         self._check_rows: dict[str, QtWidgets.QLabel] = {}
@@ -311,8 +332,8 @@ class ChatView(QtWidgets.QWidget):
             self._check_rows[key] = lbl
             self._check_btns[key] = btn
 
-        note = QtWidgets.QLabel("三项就绪后，这里会变成对话窗口。")
-        note.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:12px;")
+        note = QtWidgets.QLabel("完成配置后即可在此发起任务；写操作仍会遵循安全确认。")
+        note.setObjectName("onboardingHint")
         card_layout.addWidget(note)
 
         center = QtWidgets.QHBoxLayout()
@@ -423,12 +444,14 @@ class ChatView(QtWidgets.QWidget):
             self._prepare_insert_block(cursor)
             self.view.setTextCursor(cursor)
             self._stream_start = cursor.position()
+            self._stream_end = cursor.position()
             self._stream_text = ""
             self._stream_open = True
         self._stream_text += token
         cursor = self.view.textCursor()
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
         cursor.insertText(token)  # 纯文本增量，防 XSS；块末统一套气泡模板
+        self._stream_end = cursor.position()
         self.view.setTextCursor(cursor)
         self.view.ensureCursorVisible()
 
@@ -437,15 +460,16 @@ class ChatView(QtWidgets.QWidget):
         if not self._stream_open:
             return
         cursor = self.view.textCursor()
+        # QTextDocument 的位置按 UTF-16 计数，且换行会被规范化；不能用
+        # Python 的 len(text) 推算选区，否则含 emoji/CRLF 时会留下原始 Markdown。
         cursor.setPosition(self._stream_start)
-        cursor.movePosition(
-            QtGui.QTextCursor.MoveOperation.Right,
-            QtGui.QTextCursor.MoveMode.KeepAnchor,
-            len(text),
-        )
+        cursor.setPosition(self._stream_end, QtGui.QTextCursor.MoveMode.KeepAnchor)
         cursor.removeSelectedText()
         cursor.insertHtml(_agent_bubble(render_markdown(text)))
         self._stream_open = False
+        self._stream_text = ""
+        self._stream_start = cursor.position()
+        self._stream_end = cursor.position()
         self.view.setTextCursor(cursor)
         self.view.ensureCursorVisible()
 
@@ -591,6 +615,9 @@ class ChatView(QtWidgets.QWidget):
         self._agent_project_id = None
         self._agent_conversation_id = None
         self._stream_open = False
+        self._stream_start = 0
+        self._stream_end = 0
+        self._stream_text = ""
         self._cancel.clear()
         self.view.clear()
         proj = self.state.current_project
@@ -663,6 +690,10 @@ class ChatView(QtWidgets.QWidget):
         return text[:limit] + f"…（已截断，共 {len(text)} 字符）"
 
     def _log_tool_start(self, name: str, args_json: str) -> None:
+        # 带 tool_calls 的 LLM 轮次不会触发 on_assistant_text；在工具真正开始前
+        # 收口这轮流式文本，避免它与下一轮最终答复粘连并重复显示。
+        if self._stream_open:
+            self._finalize_stream(self._stream_text)
         self.tool_log.append_log(f"🔧 {name}({self._clip(args_json)})")
 
     def _log_tool_end(self, name: str, result: str) -> None:

@@ -27,13 +27,13 @@ class ProjectView(QtWidgets.QWidget):
     # --- UI ---
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(12)
         layout.addWidget(PageHeader(
             "项目", "Agent 的任务上下文与写操作默认落在「当前项目」的地图输出文件夹"))
 
         body = QtWidgets.QHBoxLayout()
-        body.setSpacing(10)
+        body.setSpacing(14)
 
         # 左：项目列表卡
         list_group = QtWidgets.QGroupBox("项目列表")

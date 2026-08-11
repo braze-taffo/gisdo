@@ -42,7 +42,7 @@ class _NavButton(QtWidgets.QToolButton):
         super().__init__(parent)
         self.setObjectName("navBtn")
         self.setText(f"  {text}")
-        self.setIcon(get_icon(icon_name, theme.TEXT))
+        self.setIcon(get_icon(icon_name, theme.SIDEBAR_DIM))
         self.setIconSize(QtCore.QSize(18, 18))
         self.setCheckable(True)
         self.setAutoExclusive(True)
@@ -53,12 +53,21 @@ class _NavButton(QtWidgets.QToolButton):
         self._icon_name = icon_name
 
     def _refresh_icon(self, checked: bool) -> None:
-        color = theme.ACCENT if checked else theme.TEXT
+        color = theme.SIDEBAR_TEXT if checked else theme.SIDEBAR_DIM
         self.setIcon(get_icon(self._icon_name, color))
 
     def setChecked(self, checked: bool) -> None:
         super().setChecked(checked)
         self._refresh_icon(checked)
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        if not self.isChecked():
+            self.setIcon(get_icon(self._icon_name, theme.SIDEBAR_TEXT))
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self._refresh_icon(self.isChecked())
+        super().leaveEvent(event)
 
 
 class _StatusRow(QtWidgets.QLabel):
@@ -74,10 +83,11 @@ class _StatusRow(QtWidgets.QLabel):
         self.set_ready(None, "")
 
     def set_ready(self, ready: bool | None, detail: str) -> None:
-        color = theme.TEXT_DIM if ready is None else (theme.SUCCESS if ready else theme.WARNING)
+        color = theme.SIDEBAR_DIM if ready is None else (theme.SUCCESS if ready else theme.WARNING)
         text = f"{self._label}：{detail}" if detail else f"{self._label}：—"
         self.setText(f'<span style="color:{color}">●</span> '
-                     f'<span style="color:{theme.TEXT_DIM}">{text}</span>')
+                     f'<span style="color:{theme.SIDEBAR_DIM}">{text}</span>')
+        self.setToolTip(text)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -91,8 +101,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state = AppState()
         self.log = LogConsole()
         self._current_worker = None
+        self._page_animation: QtCore.QPropertyAnimation | None = None
+        self._page_animation_page: QtWidgets.QWidget | None = None
+        self._page_animation_effect: QtWidgets.QGraphicsOpacityEffect | None = None
         self.setWindowTitle(f"GISdo · GeoScene 工作台 v{__version__}")
         self.resize(1320, 860)
+        self.setMinimumSize(1050, 700)
         self._build()
         self.state.restore_runtimes()
         self._refresh_readiness()
@@ -108,6 +122,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 视图栈
         self.stack = QtWidgets.QStackedWidget()
+        self.stack.setObjectName("pageStack")
         outer.addWidget(self.stack, 1)
 
         self._views = []
@@ -124,6 +139,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("就绪。")
         self.status_label = QtWidgets.QLabel()
+        self.status_label.setObjectName("statusSummary")
         self.status.addPermanentWidget(self.status_label)
 
         self._build_menu()
@@ -137,23 +153,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_sidebar(self) -> QtWidgets.QWidget:
         sidebar = QtWidgets.QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(196)
+        sidebar.setFixedWidth(220)
         layout = QtWidgets.QVBoxLayout(sidebar)
-        layout.setContentsMargins(12, 14, 12, 12)
-        layout.setSpacing(4)
+        layout.setContentsMargins(14, 18, 14, 14)
+        layout.setSpacing(5)
 
         # Logo 区
+        brand_row = QtWidgets.QHBoxLayout()
+        brand_row.setSpacing(10)
+        mark = QtWidgets.QLabel("G")
+        mark.setObjectName("brandMark")
+        mark.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(38, 38)
+        brand_row.addWidget(mark)
+        brand_text = QtWidgets.QVBoxLayout()
+        brand_text.setSpacing(0)
         title = QtWidgets.QLabel("GISdo")
         title.setObjectName("appTitle")
         version = QtWidgets.QLabel(f"GeoScene 工作台 v{__version__}")
         version.setObjectName("appVersion")
-        layout.addWidget(title)
-        layout.addWidget(version)
-        layout.addSpacing(14)
+        brand_text.addWidget(title)
+        brand_text.addWidget(version)
+        brand_row.addLayout(brand_text, 1)
+        layout.addLayout(brand_row)
+        layout.addSpacing(16)
 
         # 导航按钮
         self.nav_buttons: list[_NavButton] = []
         for index, (name, icon_name, tip) in enumerate(_PAGES):
+            if index in (0, 3):
+                section = QtWidgets.QLabel("工作区" if index == 0 else "GIS 工具")
+                section.setObjectName("navSection")
+                layout.addWidget(section)
             btn = _NavButton(name, icon_name)
             btn.setToolTip(f"{tip}（Ctrl+{index + 1}）")
             btn.clicked.connect(lambda _=False, i=index: self._navigate_to(i))
@@ -163,12 +194,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 就绪状态卡
         card = QtWidgets.QFrame()
-        card.setObjectName("card")
+        card.setObjectName("sidebarStatusCard")
         card_layout = QtWidgets.QVBoxLayout(card)
-        card_layout.setContentsMargins(10, 8, 10, 8)
-        card_layout.setSpacing(2)
+        card_layout.setContentsMargins(12, 11, 12, 11)
+        card_layout.setSpacing(5)
         head = QtWidgets.QLabel("就绪状态")
-        head.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 11px; font-weight: 600;")
+        head.setObjectName("sidebarStatusTitle")
         card_layout.addWidget(head)
         self.status_rows: dict[str, _StatusRow] = {}
         for key, label, page in (("project", "项目", 1), ("runtime", "运行时", 2), ("llm", "LLM", 6)):
@@ -204,9 +235,9 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(scroll_btn)
 
         bar_widget = QtWidgets.QWidget()
-        bar_widget.setStyleSheet(f"background: {theme.CARD}; border-bottom: 1px solid {theme.BORDER};")
+        bar_widget.setObjectName("logToolbar")
         bar_widget.setLayout(toolbar)
-        bar_widget.setFixedHeight(26)
+        bar_widget.setFixedHeight(30)
         vbox.addWidget(bar_widget)
         vbox.addWidget(self.log, 1)
 
@@ -217,6 +248,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
         self.log_dock.setMinimumHeight(120)
         self.resizeDocks([self.log_dock], [150], QtCore.Qt.Orientation.Vertical)
+        self.log_dock.hide()
 
     def _build_shortcuts(self) -> None:
         for index in range(len(_PAGES)):
@@ -234,9 +266,60 @@ class MainWindow(QtWidgets.QMainWindow):
     def _navigate_to(self, index: int) -> None:
         if not 0 <= index < self.stack.count():
             return
+        changed = self.stack.currentIndex() != index
         self.stack.setCurrentIndex(index)
         for i, btn in enumerate(self.nav_buttons):
             btn.setChecked(i == index)
+        if hasattr(self, "status"):
+            self.status.showMessage(_PAGES[index][2], 4500)
+        if changed:
+            self._animate_current_page()
+
+    def _animate_current_page(self) -> None:
+        """用短促淡入提示页面切换，不阻塞连续导航。"""
+        page = self.stack.currentWidget()
+        if page is None:
+            return
+        self._clear_page_animation()
+        old_effect = page.graphicsEffect()
+        if old_effect is not None:
+            page.setGraphicsEffect(None)
+        effect = QtWidgets.QGraphicsOpacityEffect(page)
+        page.setGraphicsEffect(effect)
+        animation = QtCore.QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(150)
+        animation.setStartValue(0.72)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+        self._page_animation = animation
+        self._page_animation_page = page
+        self._page_animation_effect = effect
+
+        animation.finished.connect(lambda: self._clear_page_animation(animation))
+        animation.start()
+
+    def _clear_page_animation(
+        self,
+        expected: QtCore.QPropertyAnimation | None = None,
+    ) -> None:
+        """停止并释放当前页面动画；重复调用或旧回调均安全。"""
+        animation = self._page_animation
+        if animation is None or (expected is not None and animation is not expected):
+            return
+
+        page = self._page_animation_page
+        effect = self._page_animation_effect
+        self._page_animation = None
+        self._page_animation_page = None
+        self._page_animation_effect = None
+
+        animation.stop()
+        animation.setTargetObject(None)
+        if page is not None and effect is not None and page.graphicsEffect() is effect:
+            page.setGraphicsEffect(None)
+        elif effect is not None:
+            effect.deleteLater()
+        animation.deleteLater()
 
     def _on_navigate_requested(self, name: str) -> None:
         """视图请求跳转：name 为页名（如 "项目"），兼容带序号的写法。"""
@@ -256,12 +339,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_rows["runtime"].set_ready(modern is not None, "已选" if modern else "未选")
         self.status_rows["llm"].set_ready(llm_ok, "已配置" if llm_ok else "未配置")
 
-        parts = [
-            f"项目 {'✓' if proj else '✗'}",
-            f"运行时 {'✓' if modern else '✗'}",
-            f"LLM {'✓' if llm_ok else '✗'}",
-        ]
-        self.status_label.setText("　".join(parts))
+        def summary(label: str, ok: bool) -> str:
+            color = theme.SUCCESS if ok else theme.WARNING
+            return f'<span style="color:{color}">●</span> {label}'
+
+        self.status_label.setText("　".join([
+            summary("项目", proj is not None),
+            summary("运行时", modern is not None),
+            summary("LLM", llm_ok),
+        ]))
 
     # ---------- 菜单与杂项 ----------
     def _build_menu(self) -> None:

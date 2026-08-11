@@ -1,6 +1,8 @@
 """失败处理测试。"""
 
+from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from gisdo.engine.failure import (
     BLANK_EXPORT,
@@ -15,6 +17,8 @@ from gisdo.engine.failure import (
     propose_retry_path,
 )
 from gisdo.engine.runner import ScriptResult
+
+_FIXED_VERSION_DATE = date(2026, 8, 8)
 
 
 def _result(returncode=1, stderr="", stdout="", json_data=None, script="x.py"):
@@ -75,14 +79,18 @@ def test_detect_partial_outputs_file(tmp_path: Path):
     assert detect_partial_outputs(str(f)) == [str(f)]
 
 
-def test_propose_retry_path_bumps_version(tmp_path: Path):
+@patch("gisdo.engine.versioning.date")
+def test_propose_retry_path_bumps_version(mock_date, tmp_path: Path):
+    mock_date.today.return_value = _FIXED_VERSION_DATE
     current = str(tmp_path / "extract_v1_20260808")
     retry = propose_retry_path(current)
     assert retry is not None
     assert "extract_v2_20260808" in retry
 
 
-def test_propose_retry_path_file(tmp_path: Path):
+@patch("gisdo.engine.versioning.date")
+def test_propose_retry_path_file(mock_date, tmp_path: Path):
+    mock_date.today.return_value = _FIXED_VERSION_DATE
     current = str(tmp_path / "map_v1_20260808.png")
     retry = propose_retry_path(current)
     assert retry is not None
@@ -94,7 +102,9 @@ def test_propose_retry_path_non_versioned_returns_none(tmp_path: Path):
     assert propose_retry_path(None) is None
 
 
-def test_failure_record_from_result_and_format(tmp_path: Path):
+@patch("gisdo.engine.versioning.date")
+def test_failure_record_from_result_and_format(mock_date, tmp_path: Path):
+    mock_date.today.return_value = _FIXED_VERSION_DATE
     out = str(tmp_path / "extract_v1_20260808")
     Path(out).mkdir()
     (Path(out) / "partial.bin").write_bytes(b"x")

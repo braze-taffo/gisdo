@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from gisdo.engine import ops
 from gisdo.engine.alignment import Alignment
@@ -24,17 +24,18 @@ class RenderView(QtWidgets.QWidget):
 
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(12)
         layout.addWidget(PageHeader("出图", "把分类线 JSON 渲染为出版级 PNG/PDF，并做像素级非空校验"))
 
         body = QtWidgets.QHBoxLayout()
-        body.setSpacing(10)
+        body.setSpacing(14)
 
         # 左：参数（三张卡，可滚动）
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         left_widget = QtWidgets.QWidget()
         left = QtWidgets.QVBoxLayout(left_widget)
@@ -91,12 +92,15 @@ class RenderView(QtWidgets.QWidget):
         self.width_spin = QtWidgets.QDoubleSpinBox()
         self.width_spin.setRange(2, 40)
         self.width_spin.setValue(10.0)
+        self.width_spin.setFixedWidth(72)
         self.height_spin = QtWidgets.QDoubleSpinBox()
         self.height_spin.setRange(2, 40)
         self.height_spin.setValue(6.5)
+        self.height_spin.setFixedWidth(72)
         self.dpi_spin = QtWidgets.QSpinBox()
         self.dpi_spin.setRange(72, 1200)
         self.dpi_spin.setValue(300)
+        self.dpi_spin.setFixedWidth(78)
         size_row.addWidget(QtWidgets.QLabel("宽")); size_row.addWidget(self.width_spin)
         size_row.addWidget(QtWidgets.QLabel("高")); size_row.addWidget(self.height_spin)
         size_row.addWidget(QtWidgets.QLabel("DPI")); size_row.addWidget(self.dpi_spin)
@@ -140,7 +144,7 @@ class RenderView(QtWidgets.QWidget):
         left.addStretch(1)
 
         left_scroll.setWidget(left_widget)
-        body.addWidget(left_scroll, 3)
+        body.addWidget(left_scroll, 5)
 
         # 右：预览 + 校验结果
         right = QtWidgets.QVBoxLayout()
@@ -155,7 +159,7 @@ class RenderView(QtWidgets.QWidget):
         self.verify_view = JsonTreeView()
         verify_layout.addWidget(self.verify_view)
         right.addWidget(verify_group)
-        body.addLayout(right, 2)
+        body.addLayout(right, 3)
 
         layout.addLayout(body, 1)
 

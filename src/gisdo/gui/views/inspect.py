@@ -27,8 +27,8 @@ class InspectView(QtWidgets.QWidget):
 
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(12)
         layout.addWidget(PageHeader("检查", "只读解析工程/数据结构，不修改任何文件；APRX 结果会联动到「提取」页"))
 
         self.banner = Banner("", "warning")

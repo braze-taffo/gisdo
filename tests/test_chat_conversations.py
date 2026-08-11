@@ -107,3 +107,26 @@ def test_reset_only_clears_current_conversation(qtbot, tmp_path, monkeypatch):
     second_data = json.loads(second_path.read_text(encoding="utf-8"))
     assert first_data["messages"][0]["content"] == "第一条"
     assert second_data["messages"] == []
+
+
+def test_tool_turn_stream_is_closed_before_final_markdown(qtbot, tmp_path, monkeypatch):
+    """工具轮次与最终轮次必须各自收口，不能留下第二份原始 Markdown。"""
+    _state, view = _view_with_project(qtbot, tmp_path, monkeypatch)
+    view.view.clear()
+
+    progress = "正在处理 🙂 **投影**\r\n准备裁剪。"
+    view._on_token(progress)
+    view._log_tool_start("Project", "{}")
+
+    assert not view._stream_open
+    assert "**" not in view.view.toPlainText()
+
+    final = "## 汇报\n\n**裁剪完成**，共 3,913 个建筑。"
+    view._on_token(final)
+    view._on_assistant_text(final)
+
+    text = view.view.toPlainText()
+    assert text.count("正在处理") == 1
+    assert text.count("裁剪完成") == 1
+    assert "**" not in text
+    assert "##" not in text

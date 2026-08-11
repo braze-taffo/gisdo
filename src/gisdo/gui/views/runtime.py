@@ -24,8 +24,8 @@ class RuntimeView(QtWidgets.QWidget):
 
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(12)
 
         layout.addWidget(PageHeader(
             "运行时", "发现本机 GeoScene/ArcGIS Pro 与 ArcMap Python 环境，选定后供各功能页使用"))

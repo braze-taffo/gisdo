@@ -16,9 +16,9 @@ class PageHeader(QtWidgets.QWidget):
     def __init__(self, title: str, subtitle: str = "", parent=None):
         super().__init__(parent)
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(2, 0, 2, 4)
+        layout.setContentsMargins(0, 0, 0, 8)
         text_col = QtWidgets.QVBoxLayout()
-        text_col.setSpacing(2)
+        text_col.setSpacing(4)
         title_label = QtWidgets.QLabel(title)
         title_label.setObjectName("pageTitle")
         text_col.addWidget(title_label)
@@ -29,7 +29,7 @@ class PageHeader(QtWidgets.QWidget):
         text_col.addWidget(self.subtitle_label)
         layout.addLayout(text_col, 1)
         self.extra = QtWidgets.QHBoxLayout()
-        self.extra.setSpacing(8)
+        self.extra.setSpacing(10)
         layout.addLayout(self.extra)
 
     def add_widget(self, widget: QtWidgets.QWidget) -> None:
@@ -47,7 +47,8 @@ class Banner(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("bannerWarn" if kind == "warning" else "bannerInfo")
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(9)
         color = theme.WARNING if kind == "warning" else theme.ACCENT
         icon_label = QtWidgets.QLabel()
         icon_label.setPixmap(get_icon("warning", color).pixmap(16, 16))
@@ -97,6 +98,9 @@ class JsonTreeView(QtWidgets.QTreeWidget):
         self.setHeaderLabels(["键", "值"])
         self.setAlternatingRowColors(True)
         self.setColumnWidth(0, 280)
+        self.setAnimated(True)
+        self.setUniformRowHeights(True)
+        self.header().setStretchLastSection(True)
 
     def show_json(self, data: Any, label: str = "") -> None:
         self.clear()
@@ -149,11 +153,12 @@ class PngPreview(QtWidgets.QScrollArea):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("previewArea")
         self.setWidgetResizable(True)
         self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self._label = QtWidgets.QLabel("（无预览）")
+        self._label = QtWidgets.QLabel("暂无预览")
+        self._label.setObjectName("emptyPreview")
         self._label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self._label.setStyleSheet(f"color: {theme.TEXT_DIM};")
         self.setWidget(self._label)
 
     def set_png(self, path: str) -> None:
@@ -161,7 +166,6 @@ class PngPreview(QtWidgets.QScrollArea):
         if pixmap.isNull():
             self._label.setText(f"无法加载图片：{path}")
             return
-        self._label.setStyleSheet("")
         self._label.setPixmap(pixmap)
         self._label.setText("")
 

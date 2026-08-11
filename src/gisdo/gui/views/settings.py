@@ -56,8 +56,8 @@ class SettingsView(QtWidgets.QWidget):
 
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(12)
         layout.addWidget(PageHeader("设置", "所有配置保存在 ~/.gisdo/settings.json，API Key 也可用 GISDO_API_KEY 环境变量"))
 
         # --- 运行时卡 ---

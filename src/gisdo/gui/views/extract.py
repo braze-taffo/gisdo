@@ -30,8 +30,8 @@ class ExtractView(QtWidgets.QWidget):
 
     def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(12)
         layout.addWidget(PageHeader("提取", "把 APRX 引用的数据按对齐块提取到版本化目录，带 SHA-256 校验清单"))
 
         self.banner = Banner("", "warning")
