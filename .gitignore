@@ -1,39 +1,15 @@
-# Build / install artifacts
-build/
-dist/
-*.egg-info/
-__pycache__/
+/target/
+/node_modules/
+/dist/
+/.idea/
+/.vscode/
+*.log
 *.py[cod]
-.eggs/
-
-# 打包预置的模型配置（含真实 API Key，不入公开仓库）
-src/gisdo/_model_config.py
-
-# Virtual envs
-.venv/
-venv/
-env/
-
-# PyInstaller
-*.spec.bak
-packaging/build/
-packaging/dist/
-
-# Claude Code session state
-.claude/
-
-# IDE
-.idea/
-.vscode/
-
-# OS
-Thumbs.db
-.DS_Store
-
-# Test / cache
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Outputs produced by the app during local testing
-outputs/
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+src-tauri/gen/

@@ -1,0 +1,8 @@
+{
+  "source": "https://github.com/coroboros/agent-skills/tree/main/skills/markitdown",
+  "commit": "e772097afda76fec230cb00e06536c21736da0fb",
+  "declared_license": "MIT",
+  "upstream_engine": "https://github.com/microsoft/markitdown",
+  "upstream_engine_commit_at_audit": "fd239d5d2be43d9b68329730206b9312c7d5a388",
+  "integration": "Reference-only audit copy. GISdo uses its own Windows/Rust document-intake skill and does not package the upstream Bash wrapper."
+}

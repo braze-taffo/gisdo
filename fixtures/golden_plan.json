@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "id": "00000000-0000-0000-0000-000000000001",
+  "goal": "将广州建筑投影到 WGS84，再用从化区边界裁剪",
+  "steps": [
+    {
+      "id": "project_buildings",
+      "runtime": "pro",
+      "tool": "management.Project",
+      "params": {
+        "in_dataset": "E:\\input\\Guangzhou_Buildings_DWG-Polygon.shp",
+        "out_dataset": "E:\\output\\Guangzhou_Buildings_WGS84_v1_20260811.shp",
+        "out_coor_system": 4326
+      },
+      "depends_on": [],
+      "validation": "dataset"
+    },
+    {
+      "id": "clip_conghua",
+      "runtime": "pro",
+      "tool": "analysis.Clip",
+      "params": {
+        "in_features": "E:\\output\\Guangzhou_Buildings_WGS84_v1_20260811.shp",
+        "clip_features": "E:\\input\\440117.shp",
+        "out_feature_class": "E:\\output\\从化区建筑_裁剪结果_v1_20260811.shp"
+      },
+      "depends_on": ["project_buildings"],
+      "validation": "dataset"
+    }
+  ],
+  "expected_outputs": [
+    "E:\\output\\Guangzhou_Buildings_WGS84_v1_20260811.shp",
+    "E:\\output\\从化区建筑_裁剪结果_v1_20260811.shp"
+  ]
+}
+

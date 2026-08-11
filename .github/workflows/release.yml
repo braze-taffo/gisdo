@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm ci
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: npm test
+      - run: pip install pytest
+      - run: python -m pytest -q tests/test_worker_protocol.py
+      - name: Verify tag matches application version
+        shell: pwsh
+        run: |
+          $config = Get-Content -Raw -Encoding UTF8 src-tauri/tauri.conf.json | ConvertFrom-Json
+          if ($env:GITHUB_REF_NAME -ne "v$($config.version)") {
+            throw "Tag $env:GITHUB_REF_NAME does not match application version $($config.version)."
+          }
+      - name: Build Windows distributions
+        run: npm run package:windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GISdo-${{ github.ref_name }}-windows-x64
+          path: |
+            target/release/distribution/*.exe
+            target/release/distribution/*.msi
+            target/release/distribution/*.zip
+            target/release/distribution/*.txt
+            target/release/distribution/*.json
+          if-no-files-found: error
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem target/release/distribution -File | Select-Object -ExpandProperty FullName
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $notes = "docs/release-notes-$version.md"
+          $releaseArgs = @(
+            'release', 'create', $env:GITHUB_REF_NAME,
+            '--repo', $env:GITHUB_REPOSITORY,
+            '--verify-tag',
+            '--title', "GISdo $env:GITHUB_REF_NAME"
+          )
+          if (Test-Path -LiteralPath $notes) {
+            $releaseArgs += @('--notes-file', $notes)
+          } else {
+            $releaseArgs += '--generate-notes'
+          }
+          & gh @releaseArgs @assets

@@ -1,0 +1,24 @@
+{
+  "fixture_version": 1,
+  "source_application": "GISdo legacy PySide",
+  "task": "Project Guangzhou buildings to WGS84 and clip by Conghua boundary",
+  "inputs": {
+    "buildings": "Guangzhou_Buildings_DWG-Polygon.shp",
+    "building_count": 473761,
+    "boundary": "440117.shp",
+    "boundary_polygon_count": 11
+  },
+  "operations": [
+    { "tool": "management.Project", "target_epsg": 4326 },
+    { "tool": "analysis.Clip" }
+  ],
+  "expected": {
+    "spatial_reference": "GCS_WGS_1984",
+    "epsg": 4326,
+    "count": 3913,
+    "extent": { "xmin": 113.42, "ymin": 23.43, "xmax": 113.95, "ymax": 23.81 },
+    "preserved_fields": ["Entity", "Layer", "Elevation"]
+  },
+  "notes": "Count, CRS and extent are validated inside the same Worker operation; no standalone GetCount step."
+}
+
