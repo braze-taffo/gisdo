@@ -13,3 +13,5 @@ __pycache__/
 .env.*
 !.env.example
 src-tauri/gen/
+/.claude/
+/.zcode/

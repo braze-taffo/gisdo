@@ -1354,6 +1354,7 @@ name = "gisdo-document-intake"
 version = "0.2.0"
 dependencies = [
  "calamine",
+ "encoding_rs",
  "pdf-extract",
  "serde",
  "sha2",

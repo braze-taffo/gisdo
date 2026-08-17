@@ -9,14 +9,14 @@ use gisdo_domain::{
     TaskRecord,
 };
 use gisdo_llm::{LlmClient, LlmConfig};
-use gisdo_orchestrator::{LlmPlanner, Orchestrator, OrchestratorEvent};
+use gisdo_orchestrator::{LlmPlanner, Orchestrator, OrchestratorError, OrchestratorEvent};
 use gisdo_safety::ToolRegistry;
 use gisdo_storage::{CredentialStore, Database, PerformanceMetric, WindowsCredentialStore};
 use gisdo_worker_client::{WorkerConfig, WorkerSupervisor, configured_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast::error::RecvError};
 use uuid::Uuid;
 
 type LiveOrchestrator = Orchestrator<LlmPlanner, WorkerSupervisor, LlmClient>;
@@ -25,8 +25,37 @@ struct AppState {
     database: Mutex<Database>,
     workers: Arc<WorkerSupervisor>,
     orchestrator: RwLock<Option<Arc<LiveOrchestrator>>>,
+    /// 保存设置重建编排器时仍在运行任务的旧实例；命令按 [当前]+retired 查找，
+    /// 避免在飞任务的确认/取消/提问在重建后变成 TaskNotFound。
+    retired: Mutex<Vec<Arc<LiveOrchestrator>>>,
     registry: Arc<ToolRegistry>,
     app_root: PathBuf,
+}
+
+/// 当前编排器在前、retired 在后的候选列表；命令逐个尝试，
+/// TaskNotFound 时继续找，其余错误立即返回。
+async fn live_orchestrators(state: &AppState) -> Vec<Arc<LiveOrchestrator>> {
+    let mut candidates: Vec<Arc<LiveOrchestrator>> = state
+        .orchestrator
+        .read()
+        .await
+        .clone()
+        .into_iter()
+        .collect();
+    candidates.extend(state.retired.lock().await.iter().cloned());
+    candidates
+}
+
+/// retired 中已无活跃任务的实例可以释放（其事件桥随 Arc 一起结束）。
+async fn prune_retired(state: &AppState) {
+    let mut retired = state.retired.lock().await;
+    let mut keep = Vec::new();
+    for orchestrator in retired.drain(..) {
+        if orchestrator.has_active_tasks().await {
+            keep.push(orchestrator);
+        }
+    }
+    *retired = keep;
 }
 
 #[derive(Debug, Serialize)]
@@ -280,15 +309,14 @@ async fn approve_plan(
     task_id: Uuid,
     plan_hash: String,
 ) -> Result<(), String> {
-    state
-        .orchestrator
-        .read()
-        .await
-        .as_ref()
-        .ok_or_else(|| "Orchestrator 不可用".to_owned())?
-        .approve_plan(task_id, plan_hash)
-        .await
-        .map_err(command_error)
+    for orchestrator in live_orchestrators(&state).await {
+        match orchestrator.approve_plan(task_id, plan_hash.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(OrchestratorError::TaskNotFound(_)) => continue,
+            Err(error) => return Err(command_error(error)),
+        }
+    }
+    Err(format!("任务不存在：{task_id}"))
 }
 
 #[tauri::command]
@@ -297,36 +325,36 @@ async fn answer_task_question(
     task_id: Uuid,
     answer: String,
 ) -> Result<(), String> {
-    state
-        .orchestrator
-        .read()
-        .await
-        .as_ref()
-        .ok_or_else(|| "Orchestrator 不可用".to_owned())?
-        .answer_question(task_id, answer)
-        .await
-        .map_err(command_error)
+    for orchestrator in live_orchestrators(&state).await {
+        match orchestrator.answer_question(task_id, answer.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(OrchestratorError::TaskNotFound(_)) => continue,
+            Err(error) => return Err(command_error(error)),
+        }
+    }
+    Err(format!("任务不存在：{task_id}"))
 }
 
 #[tauri::command]
 async fn cancel_task(state: State<'_, AppState>, task_id: Uuid) -> Result<(), String> {
-    state
-        .orchestrator
-        .read()
-        .await
-        .as_ref()
-        .ok_or_else(|| "Orchestrator 不可用".to_owned())?
-        .cancel_task(task_id)
-        .await
-        .map_err(command_error)
+    for orchestrator in live_orchestrators(&state).await {
+        match orchestrator.cancel_task(task_id).await {
+            Ok(()) => return Ok(()),
+            Err(OrchestratorError::TaskNotFound(_)) => continue,
+            Err(error) => return Err(command_error(error)),
+        }
+    }
+    Err(format!("任务不存在：{task_id}"))
 }
 
 #[tauri::command]
 async fn get_task(state: State<'_, AppState>, task_id: Uuid) -> Result<Option<TaskRecord>, String> {
-    Ok(match state.orchestrator.read().await.as_ref() {
-        Some(orchestrator) => orchestrator.get_task(task_id).await,
-        None => None,
-    })
+    for orchestrator in live_orchestrators(&state).await {
+        if let Some(record) = orchestrator.get_task(task_id).await {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 #[tauri::command]
@@ -441,7 +469,12 @@ async fn rebuild_orchestrator(
     settings: &Settings,
 ) -> Result<(), String> {
     if !settings.ai_enabled {
-        *state.orchestrator.write().await = None;
+        let previous = state.orchestrator.write().await.take();
+        if let Some(old) = previous
+            && old.has_active_tasks().await
+        {
+            state.retired.lock().await.push(old);
+        }
         return Ok(());
     }
     let reference = settings
@@ -456,7 +489,7 @@ async fn rebuild_orchestrator(
         base_url: settings.ai_base_url.clone(),
         api_key,
         model: settings.ai_model.clone(),
-        timeout_seconds: 120,
+        timeout_seconds: settings.ai_timeout_seconds.clamp(30, 3600),
         thinking_level: settings.ai_thinking_level.clone(),
     })
     .map_err(command_error)?;
@@ -468,14 +501,38 @@ async fn rebuild_orchestrator(
         settings.autonomy_mode,
     );
     bridge_orchestrator_events(app.clone(), orchestrator.clone());
-    *state.orchestrator.write().await = Some(orchestrator);
+    {
+        // 旧实例若仍有在飞任务则转入 retired：其确认/取消/提问仍可被命令路由到，
+        // 事件桥继续把它的结果转发给前端并落库。
+        let previous = state.orchestrator.write().await.replace(orchestrator);
+        let mut retired = state.retired.lock().await;
+        if let Some(old) = previous
+            && old.has_active_tasks().await
+        {
+            retired.push(old);
+        }
+        let mut keep = Vec::new();
+        for orchestrator in retired.drain(..) {
+            if orchestrator.has_active_tasks().await {
+                keep.push(orchestrator);
+            }
+        }
+        *retired = keep;
+    }
     Ok(())
 }
 
 fn bridge_orchestrator_events(app: AppHandle, orchestrator: Arc<LiveOrchestrator>) {
     let mut events = orchestrator.subscribe();
     tauri::async_runtime::spawn(async move {
-        while let Ok(event) = events.recv().await {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                // 消费端落后时跳过丢失的通知继续接收，绝不能退出：
+                // 退出会让该编排器的全部事件（含任务完成）从此到不了前端。
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            };
             match &event {
                 OrchestratorEvent::StepCompleted { task_id, result } => {
                     let state = app.state::<AppState>();
@@ -519,6 +576,7 @@ fn bridge_orchestrator_events(app: AppHandle, orchestrator: Arc<LiveOrchestrator
                         if let Err(error) = state.database.lock().await.save_task(&task) {
                             tracing::warn!(%error, "task persistence failed");
                         }
+                        prune_retired(&state).await;
                     }
                 }
                 OrchestratorEvent::LlmMetric {
@@ -564,36 +622,56 @@ fn bridge_worker_events(app: AppHandle, workers: Arc<WorkerSupervisor>) {
     let mut statuses = workers.subscribe_status();
     let status_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        while let Ok((runtime, status)) = statuses.recv().await {
+        loop {
+            let (runtime, status) = match statuses.recv().await {
+                Ok(event) => event,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            };
+            // WorkerStatus 是内部标签枚举；直接塞进 "status" 会形成嵌套对象，
+            // 前端拿到的是 {"status":{"pid":..,"status":"ready"}}。摊平成
+            // {"status":"ready","detail":{...}} 保持 UI 契约简单。
+            let detail = serde_json::to_value(&status).unwrap_or_default();
+            let name = detail.get("status").cloned().unwrap_or_default();
             let _ = status_app.emit(
                 "worker_status",
-                serde_json::json!({"runtime":runtime,"status":status}),
+                serde_json::json!({"runtime": runtime, "status": name, "detail": detail}),
             );
         }
     });
     let mut events = workers.subscribe_events();
     tauri::async_runtime::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            let _ = app.emit("log_line", serde_json::json!({"worker_event":event}));
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            };
+            let _ = app.emit("log_line", serde_json::json!({"worker_event": event}));
         }
     });
 }
 
 fn worker_configs(settings: &Settings, app_root: &Path) -> Vec<WorkerConfig> {
+    let request_timeout = Duration::from_secs(settings.worker_timeout_seconds.clamp(60, 86_400));
     let mut configs = Vec::new();
     if !settings.modern_python.is_empty() {
-        configs.push(configured_worker(
+        let mut config = configured_worker(
             RuntimeKind::Pro,
             Path::new(&settings.modern_python),
             app_root,
-        ));
+        );
+        config.request_timeout = request_timeout;
+        configs.push(config);
     }
     if !settings.arcmap_python.is_empty() {
-        configs.push(configured_worker(
+        let mut config = configured_worker(
             RuntimeKind::Arcmap,
             Path::new(&settings.arcmap_python),
             app_root,
-        ));
+        );
+        config.request_timeout = request_timeout;
+        configs.push(config);
     }
     configs
 }
@@ -633,6 +711,7 @@ pub fn run() {
                 database: Mutex::new(database),
                 workers: workers.clone(),
                 orchestrator: RwLock::new(None),
+                retired: Mutex::new(Vec::new()),
                 registry,
                 app_root,
             };

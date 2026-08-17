@@ -136,6 +136,9 @@ pub struct WorkerConfig {
     pub python_path: PathBuf,
     pub script_path: PathBuf,
     pub startup_timeout: Duration,
+    /// 单个 ExecutePlan/InspectPaths 请求的兜底超时。
+    /// ArcPy 工具执行期间不产生事件，挂死（数据锁、许可弹窗）只能靠它回收。
+    pub request_timeout: Duration,
 }
 
 impl WorkerConfig {
@@ -149,6 +152,7 @@ impl WorkerConfig {
             python_path: python_path.into(),
             script_path: script_path.into(),
             startup_timeout: Duration::from_secs(45),
+            request_timeout: Duration::from_secs(1800),
         }
     }
 }
@@ -160,6 +164,7 @@ struct WorkerProcess {
     tasks_completed: u32,
     pid: u32,
     severe_error: bool,
+    request_timeout: Duration,
     #[cfg(windows)]
     _job: windows_job::Job,
 }
@@ -204,6 +209,7 @@ impl WorkerProcess {
             tasks_completed: 0,
             pid,
             severe_error: false,
+            request_timeout: config.request_timeout,
             #[cfg(windows)]
             _job: job,
         };
@@ -252,20 +258,30 @@ impl WorkerProcess {
         })
         .await?;
         loop {
-            let line = self
-                .output
-                .next_line()
-                .await
-                .map_err(|error| WorkerError::Execution {
-                    message: error.to_string(),
-                    write_started: may_write,
-                    severe: true,
-                })?
-                .ok_or_else(|| WorkerError::Execution {
-                    message: "Worker 在请求完成前退出".into(),
-                    write_started: may_write,
-                    severe: true,
-                })?;
+            let line = match timeout(self.request_timeout, self.output.next_line()).await {
+                Ok(outcome) => outcome
+                    .map_err(|error| WorkerError::Execution {
+                        message: error.to_string(),
+                        write_started: may_write,
+                        severe: true,
+                    })?
+                    .ok_or_else(|| WorkerError::Execution {
+                        message: "Worker 在请求完成前退出".into(),
+                        write_started: may_write,
+                        severe: true,
+                    })?,
+                Err(_) => {
+                    self.kill_tree().await;
+                    return Err(WorkerError::Execution {
+                        message: format!(
+                            "Worker 请求超过 {} 秒未返回，已强制回收",
+                            self.request_timeout.as_secs()
+                        ),
+                        write_started: may_write,
+                        severe: true,
+                    });
+                }
+            };
             let event = parse_event(&line).map_err(|error| WorkerError::Execution {
                 message: error.to_string(),
                 write_started: may_write,
@@ -313,7 +329,22 @@ impl WorkerProcess {
         })
         .await?;
         loop {
-            let line = self.output.next_line().await?.ok_or(WorkerError::Exited)?;
+            let line = match timeout(self.request_timeout, self.output.next_line()).await {
+                Ok(outcome) => outcome
+                    .map_err(WorkerError::from)?
+                    .ok_or(WorkerError::Exited)?,
+                Err(_) => {
+                    self.kill_tree().await;
+                    return Err(WorkerError::Execution {
+                        message: format!(
+                            "Worker 巡检超过 {} 秒未返回，已强制回收",
+                            self.request_timeout.as_secs()
+                        ),
+                        write_started: false,
+                        severe: true,
+                    });
+                }
+            };
             let event = parse_event(&line)?;
             let _ = events.send(event.clone());
             match event {
@@ -360,6 +391,22 @@ impl WorkerProcess {
             Some("内存超过 1.5 GB".into())
         } else {
             None
+        }
+    }
+
+    /// 强制终止进程树；用于请求超时后的自救，避免挂死的 ArcPy 调用卡住整个运行时。
+    async fn kill_tree(&mut self) {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.pid.to_string(), "/T", "/F"])
+                .creation_flags(0x0800_0000)
+                .output()
+                .await;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self.child.start_kill();
         }
     }
 
@@ -634,21 +681,7 @@ impl WorkerSupervisor {
     pub async fn cancel_runtime(&self, runtime: RuntimeKind) -> Result<(), WorkerError> {
         let active_pid = { self.active_pids.read().get(&runtime).copied() };
         if let Some(pid) = active_pid {
-            #[cfg(windows)]
-            {
-                let _ = Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/T", "/F"])
-                    .creation_flags(0x0800_0000)
-                    .output()
-                    .await;
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .output()
-                    .await;
-            }
+            kill_pid(pid).await;
             self.active_pids.write().remove(&runtime);
             let _ = self.statuses.send((runtime, WorkerStatus::Stopped));
             return Err(WorkerError::Cancelled);
@@ -670,10 +703,25 @@ impl WorkerSupervisor {
     }
 
     pub async fn shutdown(&self) {
+        // 先无锁 taskkill 活动进程：挂死请求持有 slot 锁时，
+        // 直接等锁会让 reconfigure/save_settings 永久挂起。
+        let active: Vec<(RuntimeKind, u32)> = self
+            .active_pids
+            .read()
+            .iter()
+            .map(|(runtime, pid)| (*runtime, *pid))
+            .collect();
+        for (runtime, pid) in active {
+            self.active_pids.write().remove(&runtime);
+            kill_pid(pid).await;
+            let _ = self.statuses.send((runtime, WorkerStatus::Stopped));
+        }
         let slots: Vec<_> = self.slots.read().values().cloned().collect();
         for slot in slots {
-            let mut slot = slot.lock().await;
-            if let Some(process) = slot.process.take() {
+            // 进程已被杀，执行中的请求会立刻 EOF 并释放锁；限时等待防止意外卡死。
+            if let Ok(mut slot) = timeout(Duration::from_secs(10), slot.lock()).await
+                && let Some(process) = slot.process.take()
+            {
                 process.shutdown().await;
             }
         }
@@ -694,6 +742,25 @@ pub fn configured_worker(runtime: RuntimeKind, python: &Path, app_root: &Path) -
             .join(folder)
             .join("worker_server.py"),
     )
+}
+
+/// 强杀进程树（含子进程），不等待、不持有任何锁。
+async fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .await;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output()
+            .await;
+    }
 }
 
 #[cfg(windows)]

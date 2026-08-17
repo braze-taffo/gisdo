@@ -103,8 +103,50 @@ fn migrate_preview_database(source: &Path, destination: &Path) -> Result<bool, S
         source,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    source_connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+    // VACUUM INTO 要求目标不存在；先写临时文件再原子改名，迁移中断不会留下半成品库。
+    let staging = sibling_path(destination, ".gisdo-tmp");
+    let _ = fs::remove_file(&staging);
+    if let Err(error) =
+        source_connection.execute("VACUUM INTO ?1", [staging.to_string_lossy().as_ref()])
+    {
+        let _ = fs::remove_file(&staging);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&staging, destination) {
+        let _ = fs::remove_file(&staging);
+        return Err(error.into());
+    }
     Ok(true)
+}
+
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// 目标库已存在时先做完整性检查；损坏则整体改名隔离，让启动继续走迁移/新建。
+fn quarantine_corrupt_database(path: &Path) -> Result<(), StorageError> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    // 用读写方式打开：WAL 库若需恢复，只读连接会直接失败而被误判为损坏。
+    let intact = match Connection::open(path) {
+        Ok(connection) => connection
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .map(|value| value.trim().eq_ignore_ascii_case("ok"))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if intact {
+        return Ok(());
+    }
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let corrupted = sibling_path(path, &format!(".corrupt-{timestamp}"));
+    fs::rename(path, &corrupted)?;
+    let _ = fs::rename(sibling_path(path, "-wal"), sibling_path(&corrupted, "-wal"));
+    let _ = fs::rename(sibling_path(path, "-shm"), sibling_path(&corrupted, "-shm"));
+    Ok(())
 }
 
 pub struct Database {
@@ -125,6 +167,7 @@ pub struct PerformanceMetric {
 impl Database {
     pub fn open_default() -> Result<Self, StorageError> {
         let path = database_path()?;
+        quarantine_corrupt_database(&path)?;
         migrate_preview_database(&preview_database_path()?, &path)?;
         Self::open(path)
     }
@@ -406,7 +449,16 @@ impl Database {
             return Ok(());
         }
         let legacy: LegacySettings = serde_json::from_slice(&fs::read(path)?)?;
-        let credential_ref = if legacy.ai_api_key.is_empty() {
+        // 仅在应用内还没有任何设置行（真正的首次导入）时才写入凭据；
+        // 否则旧版 settings.json 的任何字节变化触发重导入时，
+        // 会把凭据管理器里用户后来配置的新 Key 静默覆盖回旧值。
+        let settings_present: bool = transaction
+            .query_row("SELECT COUNT(*) FROM settings WHERE id=1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count > 0)
+            .unwrap_or(false);
+        let credential_ref = if legacy.ai_api_key.is_empty() || settings_present {
             None
         } else {
             credentials.set(LLM_KEY_ACCOUNT, &legacy.ai_api_key)?;
@@ -424,6 +476,7 @@ impl Database {
             autonomy_mode: parse_autonomy(&legacy.autonomy_mode),
             language: legacy.language,
             execution_engine: ExecutionEngine::Worker,
+            ..Settings::default()
         };
         transaction.execute("INSERT INTO settings(id,body_json,updated_at) VALUES(1,?1,?2) ON CONFLICT(id) DO NOTHING",
             params![serde_json::to_string(&settings)?, Utc::now().to_rfc3339()])?;
@@ -743,5 +796,52 @@ mod tests {
 
         let migrated = Database::open(&destination_path).unwrap();
         assert_eq!(migrated.load_settings().unwrap().ai_model, "preview-model");
+    }
+
+    #[test]
+    fn migration_survives_a_stale_staging_file_and_leaves_none_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let preview_path = root.path().join("GISdo Next").join("gisdo.db");
+        let destination_path = root.path().join("GISdo").join("gisdo.db");
+        let preview = Database::open(&preview_path).unwrap();
+        preview.save_settings(&Settings::default()).unwrap();
+        drop(preview);
+        // 上一次迁移中断残留的临时文件不应让本次迁移失败。
+        fs::create_dir_all(root.path().join("GISdo")).unwrap();
+        fs::write(
+            root.path().join("GISdo").join("gisdo.db.gisdo-tmp"),
+            b"stale",
+        )
+        .unwrap();
+        assert!(migrate_preview_database(&preview_path, &destination_path).unwrap());
+        assert!(destination_path.is_file());
+        assert!(
+            !root
+                .path()
+                .join("GISdo")
+                .join("gisdo.db.gisdo-tmp")
+                .exists()
+        );
+        Database::open(&destination_path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_database_is_quarantined_and_healthy_one_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("gisdo.db");
+        fs::write(&path, b"this is definitely not a sqlite database").unwrap();
+        quarantine_corrupt_database(&path).unwrap();
+        assert!(!path.exists());
+        let quarantined = fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("gisdo.db.corrupt-"));
+        assert!(quarantined.is_some(), "损坏库应被改名保留而不是删除");
+
+        let healthy = root.path().join("healthy.db");
+        Database::open(&healthy).unwrap();
+        quarantine_corrupt_database(&healthy).unwrap();
+        assert!(healthy.is_file());
     }
 }

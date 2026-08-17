@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -36,12 +37,13 @@ export function StatusIcon({ status }: { status: TaskStatus }) {
   return <LoaderCircle className="h-4 w-4 animate-spin text-lime" />;
 }
 
-export function MarkdownMessage({ message }: { message: UiMessage }) {
+/** memo：流式期间每 token 触发的是目标消息的重建，历史消息不重跑 Markdown 解析。 */
+export const MarkdownMessage = memo(function MarkdownMessage({ message }: { message: UiMessage }) {
   if (message.role === "user") return <div className="ml-auto max-w-[78%] animate-fade-up rounded-2xl rounded-br-md bg-[#18372f] px-4 py-3 text-[15px] leading-7 text-[#edf8f4]">{message.content}</div>;
   return <div className="markdown-body max-w-[880px] animate-fade-up text-[15px] leading-7 text-[#dbe7e3]">
     {/* The content has exactly one presentation path: rendered Markdown. */}
     <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
     {message.streaming && <span aria-label="streaming" className="ml-1 inline-block h-4 w-1 animate-pulseSoft rounded bg-mint align-middle" />}
   </div>;
-}
+});
 

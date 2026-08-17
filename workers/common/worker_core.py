@@ -234,10 +234,11 @@ def validate_official_step(arcpy, step):
         raise ProtocolError("missing required parameters for %s: %s" % (tool, ", ".join(missing)))
     inputs = []
     outputs = []
+    has_output_param = any(item["direction"] == "Output" for item in schema)
     for item in schema:
         if item["name"] not in params or not looks_like_dataset_type(item["datatype"]):
             continue
-        targets = [to_text(item) for item in values(params[item["name"]]) if isinstance(item, (bytes, type(u"")))]
+        targets = [to_text(raw) for raw in values(params[item["name"]]) if isinstance(raw, (bytes, type(u"")))]
         if item["direction"] == "Output":
             outputs.extend(targets)
         elif item["direction"] == "Input":
@@ -259,7 +260,7 @@ def validate_official_step(arcpy, step):
         if arcpy.Exists(path) or os.path.exists(path):
             raise ProtocolError("output already exists: %s" % path)
     validate_free_space(inputs, outputs)
-    return toolbox, tool_name, coerce_official_params(arcpy, schema, params), outputs
+    return toolbox, tool_name, coerce_official_params(arcpy, schema, params), outputs, has_output_param
 
 
 def dataset_bytes(path):
@@ -636,10 +637,10 @@ def execute_step(arcpy, runtime_kind, request_id, step):
             write_started = step.get("tool") in ("package_project",)
             result, artifacts = run_custom(arcpy, runtime_kind, step)
         else:
-            toolbox, tool_name, params, outputs = validate_official_step(arcpy, step)
+            toolbox, tool_name, params, outputs, has_output_param = validate_official_step(arcpy, step)
             emit({"type": "progress", "request_id": request_id, "step_id": step_id, "percent": 5.0, "message": "validation complete"})
             arcpy.env.overwriteOutput = False
-            write_started = bool(outputs)
+            write_started = bool(outputs) or has_output_param
             ensure_output_parents(outputs)
             function = getattr(getattr(arcpy, toolbox), tool_name)
             tool_result = function(**params)

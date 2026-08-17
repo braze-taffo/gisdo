@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use calamine::{Reader, open_workbook_auto};
@@ -13,6 +14,7 @@ pub const DEFAULT_MAX_DOCUMENTS: usize = 32;
 pub const DEFAULT_MAX_DOCUMENT_CHARACTERS: usize = 80_000;
 pub const DEFAULT_MAX_CORPUS_CHARACTERS: usize = 240_000;
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "docx", "pptx", "xlsx", "xls", "xlsm", "xlsb", "ods", "md", "txt", "csv", "json", "xml",
@@ -143,17 +145,32 @@ pub fn extract_corpus(
             corpus.truncated = true;
             break;
         }
-        match extract_document(&path, max_document_characters.min(remaining)) {
-            Ok(document) => {
+        let budget = max_document_characters.min(remaining);
+        // 解析器（pdf-extract 等）可能 panic；单份文档崩溃只记警告，不拖垮整批语料。
+        match catch_unwind(AssertUnwindSafe(|| extract_document(&path, budget))) {
+            Ok(Ok(document)) => {
                 remaining = remaining.saturating_sub(document.characters);
                 corpus.total_characters += document.characters;
                 corpus.truncated |= document.truncated;
                 corpus.documents.push(document);
             }
-            Err(error) => corpus.warnings.push(error.to_string()),
+            Ok(Err(error)) => corpus.warnings.push(error.to_string()),
+            Err(panic) => corpus.warnings.push(format!(
+                "解析 {} 时发生内部错误（{}），已跳过该文档",
+                path.display(),
+                panic_message(&panic)
+            )),
         }
     }
     corpus
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("未知原因")
 }
 
 pub fn extract_document(
@@ -177,11 +194,11 @@ pub fn extract_document(
     let mut warnings = Vec::new();
     let content = match extension.as_str() {
         "pdf" => extract_pdf(path, &mut warnings)?,
-        "docx" => extract_docx(path)?,
-        "pptx" => extract_pptx(path)?,
+        "docx" => extract_docx(path, &mut warnings)?,
+        "pptx" => extract_pptx(path, &mut warnings)?,
         "xlsx" | "xls" | "xlsm" | "xlsb" | "ods" => extract_spreadsheet(path)?,
-        "html" | "htm" | "xml" => strip_markup(&decode_text(&bytes)),
-        "md" | "txt" | "csv" | "json" => decode_text(&bytes),
+        "html" | "htm" | "xml" => strip_markup(&decode_text(&bytes, &mut warnings)),
+        "md" | "txt" | "csv" | "json" => decode_text(&bytes, &mut warnings),
         _ => return Err(DocumentError::Unsupported(path.to_owned())),
     };
     let (content_markdown, truncated) = truncate_characters(content, max_characters);
@@ -223,12 +240,12 @@ fn extract_pdf(path: &Path, warnings: &mut Vec<String>) -> Result<String, Docume
     Ok(output.trim().to_owned())
 }
 
-fn extract_docx(path: &Path) -> Result<String, DocumentError> {
-    let xml = read_zip_entry(path, "word/document.xml")?;
+fn extract_docx(path: &Path, warnings: &mut Vec<String>) -> Result<String, DocumentError> {
+    let xml = read_zip_entry(path, "word/document.xml", warnings)?;
     Ok(extract_xml_text(&xml, "w:t", "w:p"))
 }
 
-fn extract_pptx(path: &Path) -> Result<String, DocumentError> {
+fn extract_pptx(path: &Path, warnings: &mut Vec<String>) -> Result<String, DocumentError> {
     let file = File::open(path).map_err(|error| read_error(path, error))?;
     let mut archive = ZipArchive::new(file).map_err(|error| DocumentError::Read {
         path: path.to_owned(),
@@ -242,16 +259,13 @@ fn extract_pptx(path: &Path) -> Result<String, DocumentError> {
     names.sort_by_key(|name| numeric_suffix(name));
     let mut output = String::new();
     for (index, name) in names.into_iter().enumerate() {
-        let mut xml = String::new();
         let mut entry = archive
             .by_name(&name)
             .map_err(|error| DocumentError::Read {
                 path: path.to_owned(),
                 message: error.to_string(),
             })?;
-        entry
-            .read_to_string(&mut xml)
-            .map_err(|error| read_error(path, error))?;
+        let xml = read_entry_text_capped(&mut entry, path, warnings, MAX_ENTRY_BYTES)?;
         output.push_str(&format!(
             "\n\n## 幻灯片 {}\n\n{}",
             index + 1,
@@ -313,21 +327,65 @@ fn extract_spreadsheet(path: &Path) -> Result<String, DocumentError> {
     Ok(output.trim().to_owned())
 }
 
-fn read_zip_entry(path: &Path, name: &str) -> Result<String, DocumentError> {
+fn read_zip_entry(
+    path: &Path,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Result<String, DocumentError> {
     let file = File::open(path).map_err(|error| read_error(path, error))?;
     let mut archive = ZipArchive::new(file).map_err(|error| DocumentError::Read {
         path: path.to_owned(),
         message: error.to_string(),
     })?;
-    let mut content = String::new();
     let mut entry = archive.by_name(name).map_err(|error| DocumentError::Read {
         path: path.to_owned(),
         message: error.to_string(),
     })?;
+    read_entry_text_capped(&mut entry, path, warnings, MAX_ENTRY_BYTES)
+}
+
+/// 读取 zip 条目文本，限制解压后大小：zip 炸弹式的条目会被截断并记警告，
+/// 而不是把整个条目解进内存。
+fn read_entry_text_capped<R: Read>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+    path: &Path,
+    warnings: &mut Vec<String>,
+    cap: u64,
+) -> Result<String, DocumentError> {
+    let mut bytes = Vec::new();
     entry
-        .read_to_string(&mut content)
+        .take(cap + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| read_error(path, error))?;
-    Ok(content)
+    if bytes.len() as u64 > cap {
+        bytes.truncate(cap as usize);
+        warnings.push(format!(
+            "压缩包内条目解压后超过 {} MB，已截断",
+            cap / 1024 / 1024
+        ));
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    String::from_utf8(bytes).map_err(|error| read_error(path, error))
+}
+
+/// 查找真正的 `<w:t>`/`<w:t ...>` 开始标签；`<w:tab/>`、`<w:tc>`、`<w:tbl>` 这类
+/// 同前缀标签会被排除（前缀后只允许 `>`、`/` 或空白）。
+fn find_tag_start(xml: &str, from: usize, text_tag: &str) -> Option<usize> {
+    let prefix = format!("<{text_tag}");
+    let mut cursor = from;
+    while let Some(offset) = xml[cursor..].find(&prefix) {
+        let start = cursor + offset;
+        let after = &xml[start + prefix.len()..];
+        let boundary = after
+            .chars()
+            .next()
+            .is_some_and(|character| matches!(character, '>' | '/' | ' ' | '\t' | '\r' | '\n'));
+        if boundary {
+            return Some(start);
+        }
+        cursor = start + prefix.len();
+    }
+    None
 }
 
 fn extract_xml_text(xml: &str, text_tag: &str, paragraph_tag: &str) -> String {
@@ -335,22 +393,23 @@ fn extract_xml_text(xml: &str, text_tag: &str, paragraph_tag: &str) -> String {
     let close_text = format!("</{text_tag}>");
     let close_paragraph = format!("</{paragraph_tag}>");
     let mut cursor = 0;
-    while let Some(open_offset) = xml[cursor..].find(&format!("<{text_tag}")) {
-        let open = cursor + open_offset;
+    while let Some(open) = find_tag_start(xml, cursor, text_tag) {
         let Some(content_start_offset) = xml[open..].find('>') else {
             break;
         };
         let content_start = open + content_start_offset + 1;
+        // 自闭合空标签（<w:t/>）没有文本区，直接跳过。
+        if xml[open + 1..content_start - 1].trim_end().ends_with('/') {
+            cursor = content_start;
+            continue;
+        }
         let Some(close_offset) = xml[content_start..].find(&close_text) else {
             break;
         };
         let close = content_start + close_offset;
         output.push_str(&xml_unescape(&xml[content_start..close]));
         let next = close + close_text.len();
-        let next_text = xml[next..]
-            .find(&format!("<{text_tag}"))
-            .map(|offset| next + offset)
-            .unwrap_or(xml.len());
+        let next_text = find_tag_start(xml, next, text_tag).unwrap_or(xml.len());
         if xml[next..next_text].contains(&close_paragraph) {
             output.push('\n');
         } else {
@@ -390,7 +449,7 @@ fn xml_unescape(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn decode_text(bytes: &[u8]) -> String {
+fn decode_text(bytes: &[u8], warnings: &mut Vec<String>) -> String {
     if bytes.starts_with(&[0xFF, 0xFE]) {
         let words: Vec<u16> = bytes[2..]
             .chunks_exact(2)
@@ -405,7 +464,20 @@ fn decode_text(bytes: &[u8]) -> String {
             .collect();
         return String::from_utf16_lossy(&words);
     }
-    String::from_utf8_lossy(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)).into_owned()
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        // Windows 中文环境导出的 txt/csv 常见 GBK/GB18030 编码，严格 UTF-8 失败时回退解码。
+        Err(_) => {
+            let (text, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+            warnings.push(if had_errors {
+                "文件不是有效的 UTF-8，已按 GB18030 尽力解码（存在无法还原的字节）".into()
+            } else {
+                "已按 GB18030 解码非 UTF-8 文件".into()
+            });
+            text.into_owned()
+        }
+    }
 }
 
 fn truncate_characters(mut value: String, max_characters: usize) -> (String, bool) {
@@ -499,5 +571,65 @@ mod tests {
         assert_eq!(corpus.documents.len(), 1);
         assert!(corpus.documents[0].truncated);
         assert!(corpus.truncated);
+    }
+
+    #[test]
+    fn decodes_gb18030_text_with_warning() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("清单.txt");
+        let (bytes, _, had_errors) = encoding_rs::GB18030.encode("缓冲距离 500 米");
+        assert!(!had_errors);
+        assert!(std::str::from_utf8(&bytes).is_err());
+        fs::write(&path, bytes.as_ref()).unwrap();
+        let extracted = extract_document(&path, 10_000).unwrap();
+        assert!(extracted.content_markdown.contains("缓冲距离 500 米"));
+        assert!(
+            extracted
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GB18030"))
+        );
+    }
+
+    #[test]
+    fn docx_tab_and_table_tags_do_not_swallow_text() {
+        let xml = concat!(
+            r#"<w:document><w:body>"#,
+            r#"<w:p><w:r><w:tab/><w:t>第一段</w:t></w:r></w:p>"#,
+            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>单元格A</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>单元格B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+            r#"</w:body></w:document>"#
+        );
+        assert_eq!(
+            extract_xml_text(xml, "w:t", "w:p"),
+            "第一段\n单元格A\n单元格B"
+        );
+    }
+
+    #[test]
+    fn oversized_zip_entry_is_truncated_with_warning() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("bomb.docx");
+        let file = File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("word/document.xml", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all("A".repeat(64).as_bytes()).unwrap();
+        writer.finish().unwrap();
+
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut entry = archive.by_name("word/document.xml").unwrap();
+        let mut warnings = Vec::new();
+        let text = read_entry_text_capped(&mut entry, &path, &mut warnings, 16).unwrap();
+        assert_eq!(text.len(), 16);
+        assert!(warnings.iter().any(|warning| warning.contains("截断")));
+
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut entry = archive.by_name("word/document.xml").unwrap();
+        let mut warnings = Vec::new();
+        let text = read_entry_text_capped(&mut entry, &path, &mut warnings, 64).unwrap();
+        assert_eq!(text.len(), 64);
+        assert!(warnings.is_empty());
     }
 }

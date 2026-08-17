@@ -64,6 +64,65 @@ def test_arcmap_sources_are_python27_syntax_safe():
         compile(source, relative, "exec")
 
 
+def find_python27():
+    import glob
+    for pattern in (r"C:\Python27\ArcGIS*\python.exe", r"C:\Python27\python.exe"):
+        for candidate in sorted(glob.glob(pattern), reverse=True):
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+PY2_SNIPPET = r"""
+# -*- coding: utf-8 -*-
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join({root!r}, "workers", "common"))
+os.environ["GISDO_WORKER_FAKE_ARCPY"] = "1"
+import worker_core
+
+schema = [
+    {{"name": "in_features", "datatype": "GPFeatureLayer", "direction": "Input", "required": True}},
+    {{"name": "out_feature_class", "datatype": "DEFeatureClass", "direction": "Output", "required": True}},
+    {{"name": "buffer_distance_or_field", "datatype": "Linear Unit", "direction": "Input", "required": True}},
+]
+worker_core.parameter_schema = lambda arcpy, toolbox, tool: schema
+worker_core.validate_input_compatibility = lambda arcpy, path, datatype: None
+step = {{
+    "id": "buffer", "runtime": "arcmap", "tool": "analysis.Buffer",
+    "params": {{"in_features": r"{source}", "out_feature_class": r"{output}", "buffer_distance_or_field": "100 Meters"}},
+}}
+arcpy = worker_core.load_arcpy()
+toolbox, tool_name, params, outputs, has_output = worker_core.validate_official_step(arcpy, step)
+assert toolbox == "analysis" and tool_name == "Buffer", (toolbox, tool_name)
+assert outputs == [r"{output}"], outputs
+assert has_output is True
+print("PY2_OK")
+"""
+
+
+@pytest.mark.skipif(find_python27() is None, reason="本机没有 Python 2.7 (ArcGIS Desktop) 解释器")
+def test_official_step_validation_runs_on_real_python27(tmp_path):
+    # 列表推导式在 Py2 没有独立作用域：此前推导式变量遮蔽外层循环变量，
+    # 使任何带数据集参数的官方工具步骤在 ArcMap Worker 上抛 TypeError。
+    interpreter = find_python27()
+    source = tmp_path / "roads.shp"
+    source.write_bytes(b"x" * 1024)
+    code = PY2_SNIPPET.format(
+        root=ROOT,
+        source=str(tmp_path / "roads.shp"),
+        output=str(tmp_path / "buffer.shp"),
+    )
+    completed = subprocess.run(
+        [interpreter, "-c", code],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+    assert b"PY2_OK" in completed.stdout
+
+
 def test_worker_rejects_low_disk_before_write(tmp_path, monkeypatch):
     common = os.path.join(ROOT, "workers", "common")
     sys.path.insert(0, common)

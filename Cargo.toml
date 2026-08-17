@@ -25,6 +25,7 @@ bytes = "1"
 calamine = "0.36"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
+encoding_rs = "0.8"
 futures-util = "0.3"
 hex = "0.4"
 keyring = { version = "3", features = ["windows-native"] }
@@ -48,6 +49,9 @@ url = "2"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"

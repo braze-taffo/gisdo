@@ -39,6 +39,9 @@ const SYSTEM_RULES: &str = r#"你是 GISdo 的 GIS 规划器。你通过受控�
 
 const REPORT_RULES: &str = r#"你是 GISdo 的结果汇报器。只根据提供的结构化结果，用简洁中文生成一份 Markdown 汇报。不要重复草稿，不要捏造未提供的结果。必须包含任务、输出路径、自动校验、失败或 uncertain 产物。"#;
 
+/// 输出上限：避免端点默认值（常见 2048）把长 DAG JSON 截断成解析失败。
+const MAX_OUTPUT_TOKENS: u32 = 8192;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -153,7 +156,9 @@ impl LlmClient {
             ],
             "stream": true,
             "stream_options": {"include_usage": true},
-            "response_format": {"type":"json_object"}
+            "response_format": {"type":"json_object"},
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "temperature": 0
         });
         self.stream(with_thinking(body, &self.config), on_token)
             .await
@@ -171,7 +176,9 @@ impl LlmClient {
                 {"role":"user","content":serde_json::to_string(result_summary).map_err(|e| LlmError::Protocol(e.to_string()))?}
             ],
             "stream": true,
-            "stream_options": {"include_usage": true}
+            "stream_options": {"include_usage": true},
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "temperature": 0
         });
         self.stream(
             with_thinking(
@@ -193,19 +200,28 @@ impl LlmClient {
     ) -> Result<LlmResponse, LlmError> {
         let endpoint = chat_completions_url(&self.config.base_url)?;
         let started = Instant::now();
-        let response = self
-            .http
-            .post(endpoint)
-            .bearer_auth(&self.config.api_key)
-            .json(&body)
-            .send()
-            .await?;
+        let response = self.send_with_retry(endpoint, &body).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(LlmError::Http {
                 status,
                 body: response.text().await.unwrap_or_default(),
             });
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if content_type.contains("application/json") {
+            // 部分网关忽略 stream:true，直接返回完整 completion。
+            return Self::consume_complete_response(response, started, on_token).await;
+        }
+        if !content_type.is_empty() && !content_type.contains("text/event-stream") {
+            return Err(LlmError::Protocol(format!(
+                "端点返回了不支持的 Content-Type：{content_type}"
+            )));
         }
         let mut stream = response.bytes_stream();
         let mut decoder = SseDecoder::default();
@@ -251,6 +267,82 @@ impl LlmClient {
                 usage = parse_usage(server_usage);
             }
         }
+        if content.is_empty() {
+            return Err(LlmError::Protocol(
+                "模型返回了空内容（未解析到任何 data: 事件）".into(),
+            ));
+        }
+        Ok(LlmResponse {
+            content,
+            metrics: LlmMetrics {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                first_token_ms,
+                usage,
+            },
+        })
+    }
+
+    async fn send_with_retry(
+        &self,
+        endpoint: Url,
+        body: &Value,
+    ) -> Result<reqwest::Response, LlmError> {
+        const RETRYABLE_STATUS: [u16; 5] = [429, 500, 502, 503, 504];
+        let mut attempt = 0_u8;
+        loop {
+            let outcome = self
+                .http
+                .post(endpoint.clone())
+                .bearer_auth(&self.config.api_key)
+                .json(body)
+                .send()
+                .await;
+            let response = match outcome {
+                Ok(response) => response,
+                // 连接失败等传输错误重试一次，避免瞬时网络抖动直接杀死任务。
+                Err(_) if attempt == 0 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if attempt == 0 && RETRYABLE_STATUS.contains(&response.status().as_u16()) {
+                attempt += 1;
+                let _ = response.text().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            return Ok(response);
+        }
+    }
+
+    async fn consume_complete_response(
+        response: reqwest::Response,
+        started: Instant,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<LlmResponse, LlmError> {
+        let text = response.text().await?;
+        let payload: Value = serde_json::from_str(&text)
+            .map_err(|error| LlmError::Protocol(format!("完整响应不是有效 JSON：{error}")))?;
+        if let Some(error) = payload.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            return Err(LlmError::Protocol(format!("端点返回错误：{message}")));
+        }
+        let content = payload
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if content.is_empty() {
+            return Err(LlmError::Protocol("模型返回了空内容".into()));
+        }
+        let usage = payload.get("usage").map(parse_usage).unwrap_or_default();
+        let first_token_ms = Some(started.elapsed().as_millis() as u64);
+        on_token(&content);
         Ok(LlmResponse {
             content,
             metrics: LlmMetrics {
@@ -313,7 +405,7 @@ fn with_thinking(mut body: Value, config: &LlmConfig) -> Value {
             json!({"type": if level == "disabled" { "disabled" } else { "enabled" }}),
         );
     }
-    if !uses_enable && !uses_object || level != "disabled" {
+    if !uses_enable && !uses_object && level != "disabled" {
         map.insert(
             "reasoning_effort".into(),
             Value::String(normalized_effort(level).into()),
@@ -513,5 +605,39 @@ mod tests {
             cached_tokens: Some(80),
         };
         assert_eq!(usage.cache_hit_ratio(), Some(0.8));
+    }
+
+    #[test]
+    fn thinking_fields_are_exclusive_per_provider() {
+        let dashscope = LlmConfig {
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
+            api_key: "k".into(),
+            model: "qwen-max".into(),
+            timeout_seconds: 30,
+            thinking_level: "low".into(),
+        };
+        let body = with_thinking(json!({}), &dashscope);
+        assert_eq!(body["enable_thinking"], json!(true));
+        assert!(body.get("reasoning_effort").is_none());
+
+        let generic = LlmConfig {
+            base_url: "https://api.example.com/v1".into(),
+            thinking_level: "high".into(),
+            ..dashscope.clone()
+        };
+        let body = with_thinking(json!({}), &generic);
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("thinking").is_none());
+
+        let disabled = LlmConfig {
+            thinking_level: "disabled".into(),
+            ..generic
+        };
+        let body = with_thinking(json!({}), &disabled);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "disabled 不应注入非标准的 reasoning_effort:none"
+        );
     }
 }

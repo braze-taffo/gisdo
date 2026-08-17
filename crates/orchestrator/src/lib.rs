@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -132,13 +133,37 @@ impl LlmPlanner {
 impl Planner for LlmPlanner {
     async fn create_plan(&self, context: &Value) -> Result<PlannedOutcome, OrchestratorError> {
         let response = self.client.plan(context, |_| {}).await?;
-        let outcome = serde_json::from_str(&response.content)
+        let outcome = serde_json::from_str(extract_json_object(&response.content))
             .map_err(|error| OrchestratorError::PlannerJson(error.to_string()))?;
         Ok(PlannedOutcome {
             outcome,
             metrics: Some(response.metrics),
         })
     }
+}
+
+/// 容忍模型在 JSON 前后附加的说明文字或 Markdown 围栏：
+/// 先剥 ``` 围栏，否则截取首个 `{` 到末个 `}` 之间；都不命中则原样返回。
+fn extract_json_object(text: &str) -> &str {
+    let trimmed = text.trim();
+    if trimmed.starts_with("```") {
+        let without_fence = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .unwrap_or(trimmed)
+            .trim_end_matches("```")
+            .trim();
+        if serde_json::from_str::<serde_json::Value>(without_fence).is_ok() {
+            return without_fence;
+        }
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && start < end
+        && serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).is_ok()
+    {
+        return &trimmed[start..=end];
+    }
+    trimmed
 }
 
 #[async_trait]
@@ -321,10 +346,14 @@ impl<B: ExecutionBackend> DagExecutor<B> {
                     Ok::<_, OrchestratorError>(results)
                 }
             });
+            let mut futures = join_all(futures);
             let grouped = tokio::select! {
-                groups = join_all(futures) => groups,
+                groups = &mut futures => groups,
                 _ = cancel.cancelled() => {
                     join_all(active_runtimes.into_iter().map(|runtime| self.backend.cancel(runtime))).await;
+                    // 等待在飞请求观察到进程被杀后走完回收清理；
+                    // 直接丢弃 future 会把死进程留在 slot 里，让下一个任务撞上坏管道。
+                    let _ = tokio::time::timeout(Duration::from_secs(10), futures).await;
                     return Err(OrchestratorError::Cancelled);
                 }
             };
@@ -348,7 +377,7 @@ struct LiveTask {
     approval: Option<oneshot::Sender<String>>,
     answer: Option<oneshot::Sender<String>>,
     cancel: CancellationToken,
-    write_execution_started: bool,
+    write_execution_started: Arc<AtomicBool>,
 }
 
 pub struct Orchestrator<P: Planner, B: ExecutionBackend, R: Reporter> {
@@ -405,7 +434,7 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
                 approval: None,
                 answer: None,
                 cancel: CancellationToken::new(),
-                write_execution_started: false,
+                write_execution_started: Arc::new(AtomicBool::new(false)),
             },
         );
         let this = self.clone();
@@ -420,7 +449,17 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
     async fn run_task(&self, task_id: Uuid, mut context: Value) -> Result<(), OrchestratorError> {
         let mut replans = 0;
         let mut inventory_ready = false;
+        let (cancel, write_flag) = {
+            let mut tasks = self.tasks.lock().await;
+            let task = tasks
+                .get_mut(&task_id)
+                .ok_or(OrchestratorError::TaskNotFound(task_id))?;
+            (task.cancel.clone(), task.write_execution_started.clone())
+        };
         loop {
+            if cancel.is_cancelled() {
+                return Err(OrchestratorError::Cancelled);
+            }
             if let Some((question, options)) = required_user_input(&context) {
                 let answer = self
                     .await_user_input(task_id, question.clone(), options)
@@ -471,42 +510,40 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
             if self.autonomy != AutonomyMode::ConfirmEveryStep
                 && needs_plan_confirmation(&plan, &self.registry, self.autonomy)
             {
+                if cancel.is_cancelled() {
+                    return Err(OrchestratorError::Cancelled);
+                }
                 self.await_approval(task_id, plan.clone(), &hash).await?;
             }
             self.set_status(task_id, TaskStatus::Running).await?;
-            let cancel = self
-                .tasks
-                .lock()
-                .await
-                .get(&task_id)
-                .ok_or(OrchestratorError::TaskNotFound(task_id))?
-                .cancel
-                .clone();
+            let write_step_ids: HashSet<String> = plan
+                .steps
+                .iter()
+                .filter(|step| self.registry.is_write(&step.tool).unwrap_or(true))
+                .map(|step| step.id.clone())
+                .collect();
             let emit = |event| {
+                // 写步骤实际开始执行时才置位：整计划预置会把零写入的取消也标成 Uncertain。
+                if let OrchestratorEvent::StepStarted { step_id, .. } = &event
+                    && write_step_ids.contains(step_id)
+                {
+                    write_flag.store(true, Ordering::SeqCst);
+                }
                 let _ = self.events.send(event);
             };
             let execution = if self.autonomy == AutonomyMode::ConfirmEveryStep {
                 self.execute_with_step_confirmation(task_id, &plan, &hash, &cancel, &emit)
                     .await
             } else {
-                if plan
-                    .steps
-                    .iter()
-                    .any(|step| self.registry.is_write(&step.tool).unwrap_or(true))
-                {
-                    self.tasks
-                        .lock()
-                        .await
-                        .get_mut(&task_id)
-                        .ok_or(OrchestratorError::TaskNotFound(task_id))?
-                        .write_execution_started = true;
-                }
                 self.executor
                     .execute(task_id, &plan, &hash, &cancel, &emit)
                     .await
             };
             match execution {
                 Ok(results) => {
+                    if cancel.is_cancelled() {
+                        return Err(OrchestratorError::Cancelled);
+                    }
                     let summary = json!({"goal":plan.goal,"plan_hash":hash,"results":results,"expected_outputs":plan.expected_outputs});
                     let token_emit = |token: String| {
                         let _ = self
@@ -550,14 +587,20 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
         question: String,
         options: Vec<String>,
     ) -> Result<String, OrchestratorError> {
-        self.set_status(task_id, TaskStatus::NeedsInput).await?;
         let (sender, receiver) = oneshot::channel();
-        self.tasks
-            .lock()
-            .await
-            .get_mut(&task_id)
-            .ok_or(OrchestratorError::TaskNotFound(task_id))?
-            .answer = Some(sender);
+        {
+            let mut tasks = self.tasks.lock().await;
+            let task = tasks
+                .get_mut(&task_id)
+                .ok_or(OrchestratorError::TaskNotFound(task_id))?;
+            // 取消可能发生在提问挂出之前（例如规划期间点停止）；
+            // 此时不再登记 sender，避免任务翻回 NeedsInput 后永久悬挂。
+            if task.cancel.is_cancelled() {
+                return Err(OrchestratorError::Cancelled);
+            }
+            task.answer = Some(sender);
+        }
+        self.set_status(task_id, TaskStatus::NeedsInput).await?;
         let _ = self.events.send(OrchestratorEvent::TaskQuestion {
             task_id,
             question,
@@ -689,15 +732,20 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
         plan: TaskPlan,
         hash: &str,
     ) -> Result<(), OrchestratorError> {
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut tasks = self.tasks.lock().await;
+            let task = tasks
+                .get_mut(&task_id)
+                .ok_or(OrchestratorError::TaskNotFound(task_id))?;
+            // 与 await_user_input 同理：已取消的任务不再翻回 AwaitingApproval 悬挂。
+            if task.cancel.is_cancelled() {
+                return Err(OrchestratorError::Cancelled);
+            }
+            task.approval = Some(sender);
+        }
         self.set_status(task_id, TaskStatus::AwaitingApproval)
             .await?;
-        let (sender, receiver) = oneshot::channel();
-        self.tasks
-            .lock()
-            .await
-            .get_mut(&task_id)
-            .ok_or(OrchestratorError::TaskNotFound(task_id))?
-            .approval = Some(sender);
         let _ = self.events.send(OrchestratorEvent::PlanReady {
             task_id,
             plan,
@@ -758,7 +806,8 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
                         .await
                         .get_mut(&task_id)
                         .ok_or(OrchestratorError::TaskNotFound(task_id))?
-                        .write_execution_started = true;
+                        .write_execution_started
+                        .store(true, Ordering::SeqCst);
                 }
                 results.extend(
                     self.executor
@@ -777,7 +826,7 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
             .and_then(|task| task.record.plan.clone());
         let write_execution_started = tasks
             .get(&task_id)
-            .is_some_and(|task| task.write_execution_started);
+            .is_some_and(|task| task.write_execution_started.load(Ordering::SeqCst));
         drop(tasks);
         let cancelled_during_write =
             matches!(error, OrchestratorError::Cancelled) && write_execution_started;
@@ -805,11 +854,15 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
             Vec::new()
         };
         let _ = self.set_status(task_id, status).await;
-        let _ = self.events.send(OrchestratorEvent::TaskFailed {
-            task_id,
-            message: error.to_string(),
-            uncertain_outputs,
-        });
+        // 纯取消不再补发 TaskFailed——前端会把它当失败覆盖 cancelled 状态；
+        // Uncertain 仍需 TaskFailed 携带 uncertain_outputs 清单。
+        if !matches!(error, OrchestratorError::Cancelled) || uncertain {
+            let _ = self.events.send(OrchestratorEvent::TaskFailed {
+                task_id,
+                message: error.to_string(),
+                uncertain_outputs,
+            });
+        }
     }
 
     pub async fn approve_plan(&self, task_id: Uuid, hash: String) -> Result<(), OrchestratorError> {
@@ -871,6 +924,20 @@ impl<P: Planner + 'static, B: ExecutionBackend + 'static, R: Reporter + 'static>
             .values()
             .map(|task| task.record.clone())
             .collect()
+    }
+    /// 是否仍有未到终态的任务；设置重建时用于决定是否把旧实例转入 retired。
+    pub async fn has_active_tasks(&self) -> bool {
+        let tasks = self.tasks.lock().await;
+        tasks.values().any(|task| {
+            matches!(
+                task.record.status,
+                TaskStatus::Planning
+                    | TaskStatus::NeedsInput
+                    | TaskStatus::AwaitingApproval
+                    | TaskStatus::Running
+                    | TaskStatus::Cancelling
+            )
+        })
     }
 }
 
@@ -1329,5 +1396,19 @@ mod tests {
         assert!(!document_intake_triggered(&json!({
             "goal":"用从化边界裁剪建筑"
         })));
+    }
+
+    #[test]
+    fn planner_json_extraction_tolerates_fences_and_prose() {
+        assert_eq!(
+            extract_json_object("```json\n{\"outcome\":\"ready\"}\n```"),
+            "{\"outcome\":\"ready\"}"
+        );
+        assert_eq!(
+            extract_json_object("好的，这是计划：{\"a\":1} 请确认。"),
+            "{\"a\":1}"
+        );
+        assert_eq!(extract_json_object("  {\"a\":1}  "), "{\"a\":1}");
+        assert_eq!(extract_json_object("完全不是 JSON"), "完全不是 JSON");
     }
 }

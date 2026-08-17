@@ -118,9 +118,23 @@ pub struct Settings {
     pub ai_credential_ref: Option<String>,
     pub ai_model: String,
     pub ai_thinking_level: String,
+    /// LLM 请求总超时（秒）。长计划/长汇报在 120s 会被掐断，默认放宽到 300。
+    #[serde(default = "default_ai_timeout_seconds")]
+    pub ai_timeout_seconds: u64,
+    /// Worker 单请求执行超时（秒）。挂死的 ArcPy 工具按此回收，默认 30 分钟。
+    #[serde(default = "default_worker_timeout_seconds")]
+    pub worker_timeout_seconds: u64,
     pub autonomy_mode: AutonomyMode,
     pub language: String,
     pub execution_engine: ExecutionEngine,
+}
+
+fn default_ai_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_worker_timeout_seconds() -> u64 {
+    1800
 }
 
 impl Default for Settings {
@@ -134,6 +148,8 @@ impl Default for Settings {
             ai_credential_ref: None,
             ai_model: String::new(),
             ai_thinking_level: "auto".into(),
+            ai_timeout_seconds: default_ai_timeout_seconds(),
+            worker_timeout_seconds: default_worker_timeout_seconds(),
             autonomy_mode: AutonomyMode::ConfirmWrites,
             language: "zh".into(),
             execution_engine: ExecutionEngine::Worker,

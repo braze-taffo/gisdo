@@ -67,8 +67,16 @@ function ProjectSidebar() {
   const conversationsQuery = useQuery({ queryKey: ["conversations", activeProjectId], queryFn: () => api.listConversations(activeProjectId!), enabled: Boolean(activeProjectId) });
   const messagesQuery = useQuery({ queryKey: ["messages", activeConversationId], queryFn: () => api.listMessages(activeConversationId!), enabled: Boolean(activeConversationId) });
   useEffect(() => { if (conversationsQuery.data) setConversations(conversationsQuery.data); }, [conversationsQuery.data, setConversations]);
-  useEffect(() => { if (messagesQuery.data) setMessages(messagesQuery.data.map(({ id, role, content }) => ({ id, role, content }))); }, [messagesQuery.data, setMessages]);
-  const createConversation = useMutation({ mutationFn: () => api.createConversation(activeProjectId!), onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["conversations", activeProjectId] }) });
+  const streaming = useAppStore((s) => s.messages.some((message) => message.streaming));
+  useEffect(() => {
+    // 流式输出期间不用数据库快照覆盖本地消息：执行中只有用户消息落库，
+    // 覆盖会把正在生成的气泡抹掉，后续 token 只能重建出最新一个。
+    if (messagesQuery.data && !streaming) setMessages(messagesQuery.data.map(({ id, role, content }) => ({ id, role, content })));
+  }, [messagesQuery.data, streaming, setMessages]);
+  const createConversation = useMutation({ mutationFn: () => api.createConversation(activeProjectId!), onSuccess: async (conversation) => {
+    await queryClient.invalidateQueries({ queryKey: ["conversations", activeProjectId] });
+    setActiveConversation(conversation.id);
+  }, onError: (reason) => setActiveConversation(undefined) });
   return <aside className="flex w-[250px] shrink-0 flex-col border-r border-line/80 bg-[#091411]">
     <div className="border-b border-line/70 px-4 py-5"><div className="flex items-center justify-between"><div><Kicker>Workspace</Kicker><div className="text-sm font-semibold">项目与会话</div></div><GhostButton className="h-8 w-8 p-0" aria-label="新建会话" onClick={() => createConversation.mutate()} disabled={!activeProjectId}><MessageSquarePlus className="h-4 w-4" /></GhostButton></div></div>
     <ScrollArea.Root className="min-h-0 flex-1"><ScrollArea.Viewport className="h-full w-full p-3">
@@ -99,28 +107,51 @@ function AgentChat() {
   const messages = useAppStore((s) => s.messages);
   const activeConversationId = useAppStore((s) => s.activeConversationId);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
-  const activeTaskId = useAppStore((s) => s.activeTaskId);
-  const tasks = useAppStore((s) => s.tasks);
+  const pendingPlan = useAppStore((s) => s.pendingPlan);
+  const pendingQuestion = useAppStore((s) => s.pendingQuestion);
+  const bindTask = useAppStore((s) => s.bindTask);
   const addMessage = useAppStore((s) => s.addMessage);
-  const setTaskStatus = useAppStore((s) => s.setTaskStatus);
+  const conversationRunning = useAppStore((s) => s.conversationRunning);
   const bottom = useRef<HTMLDivElement>(null);
-  const running = activeTaskId ? ["planning", "running", "awaiting_approval", "needs_input", "cancelling"].includes(tasks[activeTaskId]?.status) : false;
-  useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [messages]);
+  const scroller = useRef<HTMLDivElement>(null);
+  const pinnedToBottom = useRef(true);
+  const running = conversationRunning();
+  useEffect(() => { if (pinnedToBottom.current) bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [messages]);
   async function submit() {
     const goal = input.trim(); if (!goal || running) return;
     setInput(""); setError(""); addMessage({ role: "user", content: goal });
     try {
-      const taskId = await api.startTask(activeConversationId, goal, { goal, project_id: activeProjectId, conversation_id: activeConversationId });
-      setTaskStatus(taskId, "planning");
+      let conversationId = activeConversationId;
+      if (!conversationId && activeProjectId) {
+        // 新项目还没有会话：先建一个再发任务，否则整段对话不会落库。
+        const conversation = await api.createConversation(activeProjectId, goal.slice(0, 24));
+        conversationId = conversation.id;
+      }
+      const taskId = await api.startTask(conversationId, goal, { goal, project_id: activeProjectId, conversation_id: conversationId });
+      bindTask(taskId, conversationId);
     } catch (reason) { setError(String(reason)); }
   }
   return <section className="relative flex min-w-0 flex-1 flex-col bg-[radial-gradient(circle_at_50%_-15%,rgba(49,119,94,.12),transparent_42%)]">
-    <ScrollArea.Root className="min-h-0 flex-1"><ScrollArea.Viewport className="h-full w-full"><div className="mx-auto flex min-h-full max-w-[940px] flex-col px-8 pb-8 pt-12">
-      {messages.length === 0 ? <Welcome /> : <div className="space-y-8">{messages.map((message) => <MarkdownMessage key={message.id} message={message} />)}</div>}
+    <div ref={scroller} className="min-h-0 flex-1 overflow-y-auto" onScroll={(event) => {
+      const element = event.currentTarget;
+      pinnedToBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+    }}><div className="mx-auto flex min-h-full max-w-[940px] flex-col px-8 pb-8 pt-12">
+      {messages.length === 0 && !pendingPlan && !pendingQuestion ? <Welcome /> : <div className="space-y-8">{messages.map((message) => <MarkdownMessage key={message.id} message={message} />)}
+        {pendingQuestion && <QuestionCard {...pendingQuestion} />}
+        {pendingPlan && <PlanCard plan={pendingPlan.plan} hash={pendingPlan.hash} taskId={pendingPlan.taskId} />}
+      </div>}
       {error && <div className="mt-6 rounded-xl border border-[#7a362d] bg-[#351914] px-4 py-3 text-sm text-[#ffb4a3]">{error}</div>}
       <div ref={bottom} />
-    </div></ScrollArea.Viewport><ScrollArea.Scrollbar orientation="vertical" className="w-2 p-0.5"><ScrollArea.Thumb className="rounded-full bg-line" /></ScrollArea.Scrollbar></ScrollArea.Root>
-    <div className="bg-gradient-to-t from-ink via-ink/95 to-transparent px-8 pb-7 pt-8"><div className="mx-auto max-w-[940px]"><div className="rounded-2xl border border-[#29463d] bg-[#0c1c17] p-2 shadow-[0_18px_55px_rgba(0,0,0,.3)] transition focus-within:border-mint/45 focus-within:shadow-glow"><textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} placeholder={activeProjectId ? "告诉我想完成什么，也可以直接粘贴文件或文件夹路径…" : "请先创建或选择项目…"} disabled={!activeProjectId || running} rows={2} className="max-h-40 min-h-[58px] w-full resize-none bg-transparent px-3 py-2 text-[15px] leading-6 text-white outline-none placeholder:text-[#587068] disabled:opacity-50" /><div className="flex items-center justify-between px-2 pb-1"><div className="flex items-center gap-2 text-[10px] text-[#5d766d]"><Sparkles className="h-3.5 w-3.5" />我会先查看数据，再决定处理方法</div>{running ? <GhostButton className="h-9 px-3" onClick={() => activeTaskId && api.cancelTask(activeTaskId)}><Square className="h-3.5 w-3.5 fill-current" />停止</GhostButton> : <Button className="h-9 w-10 p-0" onClick={() => void submit()} disabled={!input.trim() || !activeProjectId} aria-label="发送"><Send className="h-4 w-4" /></Button>}</div></div></div></div>
+    </div></div>
+    <div className="bg-gradient-to-t from-ink via-ink/95 to-transparent px-8 pb-7 pt-8"><div className="mx-auto max-w-[940px]"><div className="rounded-2xl border border-[#29463d] bg-[#0c1c17] p-2 shadow-[0_18px_55px_rgba(0,0,0,.3)] transition focus-within:border-mint/45 focus-within:shadow-glow"><textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => {
+      if (event.nativeEvent.isComposing) return; // 中文输入法确认候选词的 Enter 不发送
+      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); }
+    }} placeholder={activeProjectId ? "告诉我想完成什么，也可以直接粘贴文件或文件夹路径…" : "请先创建或选择项目…"} disabled={!activeProjectId || running} rows={2} className="max-h-40 min-h-[58px] w-full resize-none bg-transparent px-3 py-2 text-[15px] leading-6 text-white outline-none placeholder:text-[#587068] disabled:opacity-50" /><div className="flex items-center justify-between px-2 pb-1"><div className="flex items-center gap-2 text-[10px] text-[#5d766d]"><Sparkles className="h-3.5 w-3.5" />我会先查看数据，再决定处理方法</div>{running ? <GhostButton className="h-9 px-3" onClick={() => {
+      const state = useAppStore.getState();
+      const taskId = Object.entries(state.taskConversations).find(([id, conversationId]) => conversationId === state.activeConversationId && ["planning", "running", "awaiting_approval", "needs_input", "cancelling"].includes(state.tasks[id]?.status ?? ""))?.[0];
+      if (!taskId) return;
+      api.cancelTask(taskId).catch((reason) => setError(String(reason)));
+    }}><Square className="h-3.5 w-3.5 fill-current" />停止</GhostButton> : <Button className="h-9 w-10 p-0" onClick={() => void submit()} disabled={!input.trim() || !activeProjectId} aria-label="发送"><Send className="h-4 w-4" /></Button>}</div></div></div></div>
   </section>;
 }
 
@@ -144,14 +175,36 @@ function PlanCard({ plan, hash, taskId }: { plan: TaskPlan; hash: string; taskId
   const setPending = useAppStore((s) => s.setPendingPlan);
   const stepStates = useAppStore((s) => s.stepStates);
   const [busy, setBusy] = useState(false);
-  async function approve() { setBusy(true); try { await api.approvePlan(taskId, hash); setPending(undefined); } finally { setBusy(false); } }
-  return <Card className="border-mint/20 bg-mint/[.035] p-4 shadow-none"><div className="flex items-start justify-between"><div><div className="text-xs font-semibold text-mint">请确认处理方案</div><div className="mt-1 text-[10px] text-[#6d887f]">共 {plan.steps.length} 个处理步骤</div></div><ShieldCheck className="h-4 w-4 text-mint" /></div><div className="mt-4 space-y-2">{plan.steps.map((step, index) => <div key={step.id} className="flex gap-3 rounded-lg bg-black/15 p-2.5"><span className={cn("grid h-5 w-5 shrink-0 place-items-center rounded-md bg-white/5 text-[9px] text-fog", stepStates[step.id]?.status === "completed" && "bg-mint/15 text-mint")}>{stepStates[step.id]?.status === "completed" ? <Check className="h-3 w-3" /> : index + 1}</span><div className="min-w-0"><div className="truncate text-[11px] font-medium text-[#d7e5e0]">{toolLabel(step.tool)}</div><div className="mt-0.5 text-[9px] tracking-wider text-[#5f796f]">{step.stage ? `${step.stage} · ` : ""}{stepStateLabel(stepStates[step.id]?.status ?? "pending")}</div></div></div>)}</div>{plan.expected_outputs.length > 0 && <div className="mt-4 rounded-lg border border-line/70 p-2.5 text-[10px] leading-5 text-[#789087]">{plan.expected_outputs.map((path) => <div key={path} title={path}>{shortPath(path, 38)}</div>)}</div>}<Button className="mt-4 w-full" disabled={busy} onClick={() => void approve()}>{busy ? "正在确认…" : <><Check className="h-4 w-4" />确认并执行</>}</Button></Card>;
+  const [error, setError] = useState("");
+  async function approve() {
+    setBusy(true); setError("");
+    try { await api.approvePlan(taskId, hash); setPending(undefined); }
+    catch (reason) { setError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return <Card className="border-mint/20 bg-mint/[.035] p-4 shadow-none"><div className="flex items-start justify-between"><div><div className="text-xs font-semibold text-mint">请确认处理方案</div><div className="mt-1 text-[10px] text-[#6d887f]">共 {plan.steps.length} 个处理步骤</div></div><ShieldCheck className="h-4 w-4 text-mint" /></div><div className="mt-4 space-y-2">{plan.steps.map((step, index) => <div key={step.id} className="flex gap-3 rounded-lg bg-black/15 p-2.5"><span className={cn("grid h-5 w-5 shrink-0 place-items-center rounded-md bg-white/5 text-[9px] text-fog", stepStates[step.id]?.status === "completed" && "bg-mint/15 text-mint")}>{stepStates[step.id]?.status === "completed" ? <Check className="h-3 w-3" /> : index + 1}</span><div className="min-w-0 flex-1"><div className="truncate text-[11px] font-medium text-[#d7e5e0]">{toolLabel(step.tool)}</div><div className="mt-0.5 text-[9px] tracking-wider text-[#5f796f]">{step.stage ? `${step.stage} · ` : ""}{stepStateLabel(stepStates[step.id]?.status ?? "pending")}</div>{stepParamPreview(step.params)}</div></div>)}</div>{plan.expected_outputs.length > 0 && <div className="mt-4 rounded-lg border border-line/70 p-2.5 text-[10px] leading-5 text-[#789087]">{plan.expected_outputs.map((path) => <div key={path} title={path}>{shortPath(path, 38)}</div>)}</div>}{error && <div className="mt-3 rounded-lg border border-[#7a362d] bg-[#351914] px-3 py-2 text-[10px] text-[#ffb4a3]">{error}</div>}<Button className="mt-4 w-full" disabled={busy} onClick={() => void approve()}>{busy ? "正在确认…" : <><Check className="h-4 w-4" />确认并执行</>}</Button></Card>;
+}
+
+/** 展示每个步骤的输入/输出参数摘要：用户确认前必须能看到将要处理的具体数据。 */
+function stepParamPreview(params: Record<string, unknown>) {
+  const entries = Object.entries(params).filter(([, value]) => typeof value === "string" || typeof value === "number").slice(0, 3);
+  if (entries.length === 0) return null;
+  return <div className="mt-1 space-y-0.5 text-[9px] leading-4 text-[#6d857c]">{entries.map(([key, value]) => {
+    const text = String(value);
+    const display = text.length > 42 ? `${text.slice(0, 20)}…${text.slice(-18)}` : text;
+    return <div key={key} className="truncate font-mono" title={text}>{key}: {display}</div>;
+  })}</div>;
 }
 
 function QuestionCard({ taskId, question, options }: { taskId: string; question: string; options: string[] }) {
-  const setQuestion = useAppStore((s) => s.setPendingQuestion); const [busy, setBusy] = useState(false); const [custom, setCustom] = useState("");
-  async function answer(value: string) { setBusy(true); try { await api.answerTaskQuestion(taskId, value); setQuestion(undefined); } finally { setBusy(false); } }
-  return <Card className="mb-4 border-lime/20 bg-lime/[.035] p-4 shadow-none"><div className="text-xs font-semibold text-lime">需要你的选择</div><p className="mt-2 text-xs leading-6 text-[#c3d1cc]">{question}</p><div className="mt-3 space-y-2">{options.map((option) => <GhostButton key={option} disabled={busy} className="h-auto w-full justify-start py-2 text-left text-xs" onClick={() => void answer(option)}>{option}</GhostButton>)}</div><div className="mt-3 flex gap-2"><input className="field h-9 text-xs" value={custom} onChange={(event) => setCustom(event.target.value)} placeholder="或输入其他答案" /><Button className="h-9 px-3" disabled={!custom.trim() || busy} onClick={() => void answer(custom)}><Send className="h-3.5 w-3.5" /></Button></div></Card>;
+  const setQuestion = useAppStore((s) => s.setPendingQuestion); const [busy, setBusy] = useState(false); const [custom, setCustom] = useState(""); const [error, setError] = useState("");
+  async function answer(value: string) {
+    setBusy(true); setError("");
+    try { await api.answerTaskQuestion(taskId, value); setQuestion(undefined); }
+    catch (reason) { setError(String(reason)); }
+    finally { setBusy(false); }
+  }
+  return <Card className="mb-4 border-lime/20 bg-lime/[.035] p-4 shadow-none"><div className="text-xs font-semibold text-lime">需要你的选择</div><p className="mt-2 text-xs leading-6 text-[#c3d1cc]">{question}</p><div className="mt-3 space-y-2">{options.map((option) => <GhostButton key={option} disabled={busy} className="h-auto w-full justify-start py-2 text-left text-xs" onClick={() => void answer(option)}>{option}</GhostButton>)}</div><div className="mt-3 flex gap-2"><input className="field h-9 text-xs" value={custom} onChange={(event) => setCustom(event.target.value)} placeholder="或输入其他答案" /><Button className="h-9 px-3" disabled={!custom.trim() || busy} onClick={() => void answer(custom)}><Send className="h-3.5 w-3.5" /></Button></div>{error && <div className="mt-3 rounded-lg border border-[#7a362d] bg-[#351914] px-3 py-2 text-[10px] text-[#ffb4a3]">{error}</div>}</Card>;
 }
 
 function PlanTimeline({ plan }: { plan: TaskPlan }) {
@@ -184,9 +237,9 @@ function ProjectsView() {
 }
 
 function NewProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
-  const [form, setForm] = useState({ name: "", projectDir: "", mapOutputDir: "" }); const queryClient = useQueryClient();
-  const mutation = useMutation({ mutationFn: () => api.createProject(form.name, form.projectDir, form.mapOutputDir), onSuccess: async () => { onOpenChange(false); await queryClient.invalidateQueries({ queryKey: ["bootstrap"] }); window.location.reload(); } });
-  return <Dialog.Root open={open} onOpenChange={onOpenChange}><Dialog.Portal><Dialog.Overlay className="fixed inset-0 bg-black/70 backdrop-blur-sm" /><Dialog.Content className="fixed left-1/2 top-1/2 w-[520px] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-line bg-panel p-6 shadow-panel"><Dialog.Title className="text-lg font-semibold">新建 GIS 项目</Dialog.Title><Dialog.Description className="mt-2 text-xs leading-6 text-fog">设置常用数据位置和结果保存位置，之后可以直接描述任务。</Dialog.Description><div className="mt-6 space-y-4"><Field label="项目名称" value={form.name} onChange={(name) => setForm({ ...form, name })} /><Field label="项目文件夹" value={form.projectDir} onChange={(projectDir) => setForm({ ...form, projectDir })} placeholder="E:\\GIS\\项目" /><Field label="地图输出文件夹" value={form.mapOutputDir} onChange={(mapOutputDir) => setForm({ ...form, mapOutputDir })} placeholder="E:\\GIS\\项目\\outputs" /></div><div className="mt-6 flex justify-end gap-2"><Dialog.Close asChild><GhostButton>取消</GhostButton></Dialog.Close><Button onClick={() => mutation.mutate()} disabled={!form.name.trim()}>创建</Button></div><Dialog.Close className="absolute right-4 top-4 text-fog hover:text-white"><X className="h-4 w-4" /></Dialog.Close></Dialog.Content></Dialog.Portal></Dialog.Root>;
+  const [form, setForm] = useState({ name: "", projectDir: "", mapOutputDir: "" }); const [error, setError] = useState(""); const queryClient = useQueryClient();
+  const mutation = useMutation({ mutationFn: () => api.createProject(form.name, form.projectDir, form.mapOutputDir), onSuccess: async () => { onOpenChange(false); setError(""); await queryClient.invalidateQueries({ queryKey: ["bootstrap"] }); window.location.reload(); }, onError: (reason) => setError(String(reason)) });
+  return <Dialog.Root open={open} onOpenChange={onOpenChange}><Dialog.Portal><Dialog.Overlay className="fixed inset-0 bg-black/70 backdrop-blur-sm" /><Dialog.Content className="fixed left-1/2 top-1/2 w-[520px] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-line bg-panel p-6 shadow-panel"><Dialog.Title className="text-lg font-semibold">新建 GIS 项目</Dialog.Title><Dialog.Description className="mt-2 text-xs leading-6 text-fog">设置常用数据位置和结果保存位置，之后可以直接描述任务。</Dialog.Description><div className="mt-6 space-y-4"><Field label="项目名称" value={form.name} onChange={(name) => setForm({ ...form, name })} /><Field label="项目文件夹" value={form.projectDir} onChange={(projectDir) => setForm({ ...form, projectDir })} placeholder="E:\\GIS\\项目" /><Field label="地图输出文件夹" value={form.mapOutputDir} onChange={(mapOutputDir) => setForm({ ...form, mapOutputDir })} placeholder="E:\\GIS\\项目\\outputs" /></div><div className="mt-6 flex justify-end gap-2"><Dialog.Close asChild><GhostButton>取消</GhostButton></Dialog.Close><Button onClick={() => mutation.mutate()} disabled={!form.name.trim() || mutation.isPending}>{mutation.isPending ? "正在创建…" : "创建"}</Button></div>{error && <div className="mt-3 rounded-lg border border-[#7a362d] bg-[#351914] px-3 py-2 text-[10px] text-[#ffb4a3]">{error}</div>}<Dialog.Close className="absolute right-4 top-4 text-fog hover:text-white"><X className="h-4 w-4" /></Dialog.Close></Dialog.Content></Dialog.Portal></Dialog.Root>;
 }
 
 function RuntimeView() {
@@ -196,11 +249,15 @@ function RuntimeView() {
 
 function SettingsView() {
   const current = useAppStore((s) => s.settings); const setSettings = useAppStore((s) => s.setSettings);
-  const [draft, setDraft] = useState<Settings | undefined>(current); const [apiKey, setApiKey] = useState(""); const [saved, setSaved] = useState(false);
+  const [draft, setDraft] = useState<Settings | undefined>(current); const [apiKey, setApiKey] = useState(""); const [saved, setSaved] = useState(false); const [error, setError] = useState("");
   useEffect(() => setDraft(current), [current]);
-  const mutation = useMutation({ mutationFn: () => api.saveSettings(draft!, apiKey), onSuccess: (settings) => { setSettings(settings); setApiKey(""); setSaved(true); setTimeout(() => setSaved(false), 1800); } });
+  const mutation = useMutation({
+    mutationFn: () => api.saveSettings(draft!, apiKey),
+    onSuccess: (settings) => { setSettings(settings); setApiKey(""); setSaved(true); setError(""); setTimeout(() => setSaved(false), 1800); },
+    onError: (reason) => setError(String(reason)),
+  });
   if (!draft) return null;
-  return <Page title="设置" kicker="Local configuration" action={<Button onClick={() => mutation.mutate()}>{saved ? <><Check className="h-4 w-4" />已保存</> : "保存设置"}</Button>}><div className="grid max-w-5xl gap-5 lg:grid-cols-2"><Card className="p-6"><Kicker>GIS Environment</Kicker><h3 className="mb-5 font-semibold">GIS 软件位置</h3><div className="space-y-4"><Field label="Pro / GeoScene Python 3" value={draft.modern_python} onChange={(modern_python) => setDraft({ ...draft, modern_python })} /><Field label="ArcMap Python 2.7" value={draft.arcmap_python} onChange={(arcmap_python) => setDraft({ ...draft, arcmap_python })} /><Field label="默认输出目录" value={draft.output_root} onChange={(output_root) => setDraft({ ...draft, output_root })} /></div></Card><Card className="p-6"><Kicker>AI Connection</Kicker><h3 className="mb-5 font-semibold">智能助手</h3><div className="space-y-4"><Toggle label="启用智能规划" checked={draft.ai_enabled} onChange={(ai_enabled) => setDraft({ ...draft, ai_enabled })} /><Field label="Base URL" value={draft.ai_base_url} onChange={(ai_base_url) => setDraft({ ...draft, ai_base_url })} placeholder="https://.../v1" /><Field label="模型" value={draft.ai_model} onChange={(ai_model) => setDraft({ ...draft, ai_model })} /><Field label="API Key（留空即保留原凭据）" value={apiKey} onChange={setApiKey} type="password" /><label className="block"><span className="mb-2 block text-xs text-fog">执行前确认</span><select value={draft.autonomy_mode} onChange={(event) => setDraft({ ...draft, autonomy_mode: event.target.value as Settings["autonomy_mode"] })} className="field"><option value="confirm_writes">执行前确认一次</option><option value="autonomous">直接执行</option><option value="confirm_every_step">每一步都确认</option></select></label></div><div className="mt-5 rounded-xl border border-line bg-black/15 p-3 text-[10px] leading-5 text-[#678078]">API Key 由 Windows 安全保存，不会写入项目文件。</div></Card></div></Page>;
+  return <Page title="设置" kicker="Local configuration" action={<Button onClick={() => mutation.mutate()} disabled={mutation.isPending}>{mutation.isPending ? "正在保存…" : saved ? <><Check className="h-4 w-4" />已保存</> : "保存设置"}</Button>}><div className="grid max-w-5xl gap-5 lg:grid-cols-2"><Card className="p-6"><Kicker>GIS Environment</Kicker><h3 className="mb-5 font-semibold">GIS 软件位置</h3><div className="space-y-4"><Field label="Pro / GeoScene Python 3" value={draft.modern_python} onChange={(modern_python) => setDraft({ ...draft, modern_python })} /><Field label="ArcMap Python 2.7" value={draft.arcmap_python} onChange={(arcmap_python) => setDraft({ ...draft, arcmap_python })} /><Field label="默认输出目录" value={draft.output_root} onChange={(output_root) => setDraft({ ...draft, output_root })} /><Field label="单任务执行超时（秒，默认 1800）" value={String(draft.worker_timeout_seconds)} onChange={(value) => setDraft({ ...draft, worker_timeout_seconds: Number(value.replace(/\D/g, "")) || 1800 })} /></div></Card><Card className="p-6"><Kicker>AI Connection</Kicker><h3 className="mb-5 font-semibold">智能助手</h3><div className="space-y-4"><Toggle label="启用智能规划" checked={draft.ai_enabled} onChange={(ai_enabled) => setDraft({ ...draft, ai_enabled })} /><Field label="Base URL" value={draft.ai_base_url} onChange={(ai_base_url) => setDraft({ ...draft, ai_base_url })} placeholder="https://.../v1" /><Field label="模型" value={draft.ai_model} onChange={(ai_model) => setDraft({ ...draft, ai_model })} /><Field label="API Key（留空即保留原凭据）" value={apiKey} onChange={setApiKey} type="password" /><Field label="模型请求超时（秒，默认 300）" value={String(draft.ai_timeout_seconds)} onChange={(value) => setDraft({ ...draft, ai_timeout_seconds: Number(value.replace(/\D/g, "")) || 300 })} /><label className="block"><span className="mb-2 block text-xs text-fog">执行前确认</span><select value={draft.autonomy_mode} onChange={(event) => setDraft({ ...draft, autonomy_mode: event.target.value as Settings["autonomy_mode"] })} className="field"><option value="confirm_writes">执行前确认一次</option><option value="autonomous">直接执行</option><option value="confirm_every_step">每一步都确认</option></select></label></div><div className="mt-5 rounded-xl border border-line bg-black/15 p-3 text-[10px] leading-5 text-[#678078]">API Key 由 Windows 安全保存，不会写入项目文件。</div>{error && <div className="mt-3 rounded-lg border border-[#7a362d] bg-[#351914] px-3 py-2 text-[10px] text-[#ffb4a3]">{error}</div>}</Card></div></Page>;
 }
 
 function Page({ title, kicker, action, children }: { title: string; kicker: string; action?: React.ReactNode; children: React.ReactNode }) { return <main className="min-h-0 flex-1 overflow-auto bg-[radial-gradient(circle_at_65%_0%,rgba(35,102,78,.12),transparent_35%)] p-8"><div className="mx-auto max-w-7xl"><div className="mb-8 flex items-end justify-between"><div><Kicker>{kicker}</Kicker><h1 className="text-3xl font-semibold tracking-[-.03em]">{title}</h1></div>{action}</div>{children}</div></main>; }

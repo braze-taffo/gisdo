@@ -10,6 +10,8 @@ const demoSettings: Settings = {
   ai_credential_ref: "llm-api-key",
   ai_model: "planner-model",
   ai_thinking_level: "medium",
+  ai_timeout_seconds: 300,
+  worker_timeout_seconds: 1800,
   autonomy_mode: "confirm_writes",
   language: "zh",
   execution_engine: "worker",

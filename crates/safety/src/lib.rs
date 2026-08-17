@@ -39,6 +39,10 @@ pub enum SafetyError {
     OutputMismatch,
     #[error("计划包含重复校验工具 {0}；执行器会自动校验 count/CRS/extent")]
     RedundantValidation(String),
+    #[error("GISdo 不执行删除操作：{0}；如需清理请手动处理对应文件")]
+    DestructiveTool(String),
+    #[error("计划不包含任何步骤")]
+    EmptyPlan,
     #[error("无法读取工具清单：{0}")]
     Inventory(String),
 }
@@ -55,6 +59,8 @@ pub struct ToolSpec {
     pub output_params: Vec<String>,
     #[serde(default)]
     pub write: bool,
+    #[serde(default)]
+    pub destructive: bool,
     #[serde(default)]
     pub default_validation: ValidationPolicy,
 }
@@ -159,6 +165,7 @@ impl ToolRegistry {
                 input_params: inputs.into_iter().map(str::to_owned).collect(),
                 output_params: outputs.into_iter().map(str::to_owned).collect(),
                 write,
+                destructive: false,
                 default_validation: validation,
             },
         );
@@ -196,7 +203,9 @@ impl ToolRegistry {
                     };
                     match param.get("direction").and_then(Value::as_str) {
                         Some("Input") => {
-                            inputs.push(param_name.to_owned());
+                            if is_path_like_datatype(param.get("datatype")) {
+                                inputs.push(param_name.to_owned());
+                            }
                             if param
                                 .get("required")
                                 .and_then(Value::as_bool)
@@ -219,6 +228,7 @@ impl ToolRegistry {
                     }
                 }
                 let write = !outputs.is_empty();
+                let destructive = short_name.starts_with("Delete") || short_name == "TruncateTable";
                 self.tools.insert(
                     name.clone(),
                     ToolSpec {
@@ -228,6 +238,7 @@ impl ToolRegistry {
                         input_params: inputs,
                         output_params: outputs,
                         write,
+                        destructive,
                         default_validation: if write {
                             ValidationPolicy::Dataset
                         } else {
@@ -262,6 +273,9 @@ impl ToolRegistry {
         let spec = self
             .get(&step.tool)
             .ok_or_else(|| SafetyError::UnknownTool(step.tool.clone()))?;
+        if spec.destructive {
+            return Err(SafetyError::DestructiveTool(step.tool.clone()));
+        }
         if spec.runtime != step.runtime {
             return Err(SafetyError::WrongRuntime {
                 tool: step.tool.clone(),
@@ -339,6 +353,72 @@ fn parameter_paths(value: Option<&Value>) -> Vec<PathBuf> {
     }
 }
 
+/// ArcPy 参数 datatype 中表示文件系统数据/文件位置的类型；组件精确匹配。
+const PATH_LIKE_DATATYPES: &[&str] = &[
+    "要素图层",
+    "要素类",
+    "表视图",
+    "表",
+    "栅格数据集",
+    "栅格图层",
+    "镶嵌图层",
+    "镶嵌数据集",
+    "工作空间",
+    "文件",
+    "文件夹",
+    "文本文件",
+    "LAS 数据集",
+    "LAS 数据集图层",
+    "TIN 图层",
+    "拓扑",
+    "拓扑图层",
+    "关系类",
+    "地址定位器",
+    "数据元素",
+    "图层",
+    "地图",
+    "工具箱",
+    "场景图层",
+    "建筑场景图层",
+    "建筑图层",
+    "轨迹图层",
+    "目录图层",
+    "公共设施网络图层",
+    "GeoDataServer",
+    "数据集",
+    "复合地理数据集",
+    "要素集",
+    "要素数据集",
+    "体素图层",
+];
+
+/// 判断参数 datatype 是否指向文件系统位置。字符串可含 `|` 分隔多类型，
+/// 数组同理；任一组件命中即按路径处理。缺失或为空按路径类处理（保守），
+/// 未识别的非空类型按值处理——存在性由 Worker 执行期的活元数据校验兜底。
+fn is_path_like_datatype(datatype: Option<&Value>) -> bool {
+    let mut components: Vec<&str> = Vec::new();
+    match datatype {
+        Some(Value::String(text)) => {
+            components.extend(text.split('|').map(str::trim));
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    components.extend(text.split('|').map(str::trim));
+                }
+            }
+        }
+        _ => return true,
+    }
+    components.retain(|component| !component.is_empty());
+    if components.is_empty() {
+        return true;
+    }
+    components
+        .iter()
+        .any(|component| PATH_LIKE_DATATYPES.contains(component))
+}
+
 pub fn validate_new_output(path: &Path) -> Result<(), SafetyError> {
     if !path.is_absolute() {
         return Err(SafetyError::RelativeOutput(path.to_owned()));
@@ -376,6 +456,9 @@ pub fn validate_plan(
     registry: &ToolRegistry,
     check_files: bool,
 ) -> Result<Vec<String>, SafetyError> {
+    if plan.steps.is_empty() {
+        return Err(SafetyError::EmptyPlan);
+    }
     let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
     let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for step in &plan.steps {
@@ -540,6 +623,7 @@ mod tests {
                 input_params: vec!["input".into()],
                 output_params: vec!["output".into()],
                 write: true,
+                destructive: false,
                 default_validation: ValidationPolicy::None,
             },
         );
@@ -572,5 +656,119 @@ mod tests {
             ],
         };
         assert!(validate_plan(&task, &registry, true).is_ok());
+    }
+
+    const INVENTORY_JSON: &str = include_str!("../../../fixtures/arcgis_tool_inventory_510.json");
+
+    fn inventory_registry() -> ToolRegistry {
+        ToolRegistry::builtin()
+            .with_arcgis_inventory(INVENTORY_JSON)
+            .unwrap()
+    }
+
+    fn pro_step(id: &str, tool: &str, params: Value) -> PlanStep {
+        PlanStep {
+            id: id.into(),
+            stage: None,
+            requirement_refs: vec![],
+            runtime: RuntimeKind::Pro,
+            tool: tool.into(),
+            params,
+            depends_on: vec![],
+            validation: ValidationPolicy::Dataset,
+        }
+    }
+
+    #[test]
+    fn value_like_input_params_are_not_path_checked() {
+        let registry = inventory_registry();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("roads.shp");
+        fs::write(&source, b"source").unwrap();
+        let output = temp.path().join("roads_buffer.shp");
+        let buffer = pro_step(
+            "buffer",
+            "analysis.Buffer",
+            json!({
+                "in_features": source,
+                "out_feature_class": output,
+                "buffer_distance_or_field": "100 Meters"
+            }),
+        );
+        assert!(registry.validate_step(&buffer, true).is_ok());
+
+        let table = temp.path().join("buildings.dbf");
+        fs::write(&table, b"table").unwrap();
+        let calc = pro_step(
+            "calc",
+            "management.CalculateField",
+            json!({
+                "in_table": table,
+                "field": "POP",
+                "expression": "!POP! * 2"
+            }),
+        );
+        assert!(registry.validate_step(&calc, true).is_ok());
+    }
+
+    #[test]
+    fn path_like_inputs_still_require_existence() {
+        let registry = inventory_registry();
+        let temp = tempfile::tempdir().unwrap();
+        let step = pro_step(
+            "buffer",
+            "analysis.Buffer",
+            json!({
+                "in_features": temp.path().join("missing.shp"),
+                "out_feature_class": temp.path().join("out.shp"),
+                "buffer_distance_or_field": "100 Meters"
+            }),
+        );
+        let err = registry.validate_step(&step, true).unwrap_err();
+        assert!(matches!(err, SafetyError::MissingInput(_)));
+    }
+
+    #[test]
+    fn destructive_tools_are_rejected() {
+        let registry = inventory_registry();
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim.shp");
+        fs::write(&victim, b"victim").unwrap();
+        for tool in [
+            "management.Delete",
+            "management.DeleteFeatures",
+            "management.TruncateTable",
+        ] {
+            let step = pro_step(
+                "delete",
+                tool,
+                json!({"in_data": victim, "in_features": victim, "in_table": victim}),
+            );
+            let err = registry.validate_step(&step, false).unwrap_err();
+            assert!(
+                matches!(err, SafetyError::DestructiveTool(_)),
+                "{tool}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_plan_is_rejected() {
+        let err = validate_plan(&plan(vec![]), &ToolRegistry::builtin(), false).unwrap_err();
+        assert!(matches!(err, SafetyError::EmptyPlan));
+    }
+
+    #[test]
+    fn datatype_classification_matches_path_components_exactly() {
+        assert!(is_path_like_datatype(Some(&json!("要素图层"))));
+        assert!(is_path_like_datatype(Some(&json!(
+            "要素图层|场景图层|文件"
+        ))));
+        assert!(is_path_like_datatype(Some(&json!(["表视图", "栅格图层"]))));
+        assert!(!is_path_like_datatype(Some(&json!("SQL 表达式"))));
+        assert!(!is_path_like_datatype(Some(&json!("字段"))));
+        assert!(!is_path_like_datatype(Some(&json!(["线性单位", "字段"]))));
+        assert!(is_path_like_datatype(None));
+        assert!(is_path_like_datatype(Some(&json!(""))));
     }
 }

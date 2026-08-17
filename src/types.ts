@@ -11,6 +11,8 @@ export interface Settings {
   ai_credential_ref?: string;
   ai_model: string;
   ai_thinking_level: string;
+  ai_timeout_seconds: number;
+  worker_timeout_seconds: number;
   autonomy_mode: AutonomyMode;
   language: string;
   execution_engine: "worker" | "legacy";
